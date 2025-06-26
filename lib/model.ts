@@ -46,7 +46,7 @@ export class OpenAiModel<TModelContext> extends AiModel<TModelContext> {
     messages: AiModelMessage[]
   ): Promise<AiResult<string>> {
     const input = this.#createInput(context, messages);
-    this.#logger.log("info", "analyze", "Prompt started", {
+    this.#logger.log("debug", "prompt", "Prompt started", {
       messages,
       context,
     });
@@ -60,7 +60,7 @@ export class OpenAiModel<TModelContext> extends AiModel<TModelContext> {
     });
 
     const outputText = response.output_text ?? "";
-    this.#logger.log("debug", "analyze", "Prompt completed", response.output);
+    this.#logger.log("debug", "prompt", "Prompt completed", response.output);
 
     for (const item of response.output) {
       input.push(item);
@@ -78,7 +78,7 @@ export class OpenAiModel<TModelContext> extends AiModel<TModelContext> {
     schema: object
   ): Promise<AiResult<T>> {
     const input = this.#createInput(context, messages);
-    this.#logger.log("info", "analyze", "Prompt started", {
+    this.#logger.log("debug", "promptWithSchema", "Prompt started", {
       messages,
       context,
     });
@@ -100,7 +100,12 @@ export class OpenAiModel<TModelContext> extends AiModel<TModelContext> {
     });
 
     const outputText = response.output_text ?? "";
-    this.#logger.log("debug", "analyze", "Prompt completed", response.output);
+    this.#logger.log(
+      "debug",
+      "promptWithSchema",
+      "Prompt completed",
+      response.output
+    );
 
     for (const item of response.output) {
       input.push(item);
