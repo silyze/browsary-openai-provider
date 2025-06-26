@@ -1,4 +1,5 @@
 import {
+  AiModel,
   AiProvider,
   AiResult,
   AnalysisResult,
@@ -23,9 +24,8 @@ import {
   pipelineSchema,
 } from "@silyze/browsary-pipeline";
 import { assert } from "@mojsoski/assert";
-
-const MAX_RESPONSE_FIX_RETRY = 5;
-const DEFAULT_TEMPERATURE = 0.1;
+import { OpenAiModel } from "./model";
+import { DEFAULT_TEMPERATURE, MAX_RESPONSE_FIX_RETRY } from "./defaults";
 
 export type OpenAiConfig = {
   openAi: OpenAI | Promise<OpenAI>;
@@ -38,6 +38,17 @@ export type OpenAiConfig = {
 };
 
 export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
+  createModel<TModelContext>(
+    model: string,
+    context: TModelContext
+  ): AiModel<TModelContext> {
+    return new OpenAiModel<TModelContext>(
+      this.config.logger.createScope(model),
+      model,
+      this.config,
+      context
+    );
+  }
   public constructor(
     config: OpenAiConfig,
     functionCall: (context: Page, name: string, params: any) => Promise<unknown>
@@ -61,6 +72,7 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
 
   static get models() {
     return {
+      generic: ["gpt-4o-mini"],
       analyze: ["gpt-4o-mini"],
       generate: ["gpt-4o-mini"],
     };

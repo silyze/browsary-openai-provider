@@ -1,7 +1,7 @@
 import OpenAI from "openai";
 import {
   booleanInputType,
-  integerInputType,
+  numberType,
   stringInputType,
   waitEventType,
 } from "@silyze/browsary-pipeline";
@@ -85,7 +85,7 @@ export const analyzeTools: OpenAI.Responses.FunctionTool[] = [
           type: "string",
         },
         text: stringInputType,
-        delayMs: integerInputType,
+        delayMs: numberType,
       },
       required: ["selector", "text", "delayMs"],
       additionalProperties: false,
