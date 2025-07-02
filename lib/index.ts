@@ -26,6 +26,7 @@ import {
 import { assert } from "@mojsoski/assert";
 import { OpenAiModel } from "./model";
 import { DEFAULT_TEMPERATURE, MAX_RESPONSE_FIX_RETRY } from "./defaults";
+import { FunctionTool } from "../node_modules/openai/src/resources/responses/responses";
 
 export type OpenAiConfig = {
   openAi: OpenAI | Promise<OpenAI>;
@@ -227,7 +228,7 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
     };
   }
   public async generate(
-    _: Page,
+    page: Page,
     { analysis, prompt: userPrompt }: AnalysisResult,
     previousPipeline: Record<string, GenericNode>,
     onMessages?: (message: unknown[]) => Promise<void> | void
@@ -236,7 +237,7 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
 
     this.config.logger.log("info", "generate", "Generation started", {
       prompt: userPrompt,
-      analysis: analysis,
+      analysis,
     });
 
     const input: OpenAI.Responses.ResponseInput = [
@@ -252,21 +253,33 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
       },
       {
         role: "user",
-        content: `The pipeline should preform the following action:\n ${userPrompt}`,
+        content: `The pipeline should perform the following action:\n ${userPrompt}`,
       },
+    ];
+
+    const tools: FunctionTool[] = [
       {
-        role: "system",
-        content: `Reminder: All outputs must match the following schema:\n${JSON.stringify(
-          pipelineSchema,
-          null,
-          2
-        )}`,
+        type: "function",
+        name: "getNodeSchema",
+        description:
+          "Retrieve the JSON schema definition of a pipeline node type.",
+        parameters: {
+          type: "object",
+          properties: {
+            node: {
+              type: "string",
+              description: "The pipeline node type, e.g., 'page::goto'",
+            },
+          },
+          required: ["node"],
+        },
+        strict: true,
       },
     ];
 
     let outputText = "";
 
-    const preformPrompt = async () => {
+    const performPrompt = async () => {
       this.config.logger.log("debug", "generate", "Prompt started", {
         prompts: input.length,
       });
@@ -277,12 +290,16 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
         if (onMessages) {
           await onMessages(input);
         }
+
         const response = await ai.responses.create({
           input,
           temperature: DEFAULT_TEMPERATURE,
           model: this.config.models?.generate ?? PIPELINE_GENERATE_MODEL,
           text: pipelineOutput,
+          tools,
+          tool_choice: "auto",
         });
+
         outputText = response.output_text ?? "";
 
         this.config.logger.log(
@@ -294,30 +311,68 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
 
         for (const item of response.output) {
           input.push(item);
+
+          if (item.type === "function_call" && item.call_id) {
+            try {
+              const params = JSON.parse(item.arguments);
+              this.config.logger.log(
+                "debug",
+                "generate",
+                "Function call started",
+                {
+                  name: item.name,
+                  params,
+                }
+              );
+
+              if (item.name !== "getNodeSchema") {
+                throw new TypeError(`Invalid function name: ${item.name}`);
+              }
+
+              const nodeName = params.node as `${string}::${string}`;
+              const nodeSchema = pipelineSchema.additionalProperties.anyOf.find(
+                (item) => item.properties.node.const === nodeName
+              );
+
+              if (!nodeSchema) {
+                throw new TypeError(`Node schema was not found`);
+              }
+
+              input.push({
+                type: "function_call_output",
+                call_id: item.call_id,
+                output: JSON.stringify(nodeSchema),
+              });
+              if (onMessages) await onMessages(input);
+            } catch (e: any) {
+              this.config.logger.log(
+                "error",
+                "generate",
+                "Function call failed",
+                {
+                  name: item.name,
+                  error: createErrorObject(e),
+                }
+              );
+
+              input.push({
+                type: "function_call_output",
+                call_id: item.call_id,
+                output: `Error while executing function: ${e.message}`,
+              });
+            }
+          }
         }
 
-        if (onMessages) {
-          await onMessages(input);
-        }
+        if (onMessages) await onMessages(input);
       } catch (e: any) {
         this.config.logger.log("error", "generate", "Prompt failed", {
           error: createErrorObject(e),
         });
-
-        this.config.logger.log("error", "generate", "Generation failed", {
-          prompt: userPrompt,
-        });
-
-        if (onMessages) {
-          await onMessages(input);
-        }
-        return {
-          messages: input,
-        };
       }
     };
 
-    await preformPrompt();
+    await performPrompt();
 
     let retryCount = 0;
 
@@ -329,19 +384,10 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
         this.config.logger.log("error", "generate", "Max retry reached", {
           error: createErrorObject(e),
         });
-        this.config.logger.log("error", "generate", "Generation failed", {
-          prompt: userPrompt,
-        });
-
-        if (onMessages) {
-          await onMessages(input);
-        }
-        return {
-          messages: input,
-        };
+        return { messages: input };
       }
 
-      let responseObject: unknown = undefined;
+      let responseObject: unknown;
 
       try {
         responseObject = JSON.parse(outputText);
@@ -363,7 +409,7 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
         });
 
         retryCount++;
-        await preformPrompt();
+        await performPrompt();
         continue;
       }
 
@@ -371,8 +417,10 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
         this.config.logger.log(
           "error",
           "generate",
-          "Failed to validate object schema",
-          { errors: getPipelineValidationErrors() }
+          "Schema validation failed",
+          {
+            errors: getPipelineValidationErrors(),
+          }
         );
 
         input.push({
@@ -385,19 +433,16 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
         });
 
         retryCount++;
-        await preformPrompt();
+        await performPrompt();
         continue;
       }
 
       const compileResult =
         this.config.pipelineProvider.compile(responseObject);
       if (!hasPipeline(compileResult)) {
-        this.config.logger.log(
-          "error",
-          "generate",
-          "Failed to compile pipeline",
-          { errors: compileResult.errors }
-        );
+        this.config.logger.log("error", "generate", "Compilation failed", {
+          errors: compileResult.errors,
+        });
 
         input.push({
           type: "message",
@@ -409,18 +454,14 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
         });
 
         retryCount++;
-        await preformPrompt();
+        await performPrompt();
         continue;
       }
 
-      this.config.logger.log("info", "generate", "Generation ended", {
+      this.config.logger.log("info", "generate", "Generation successful", {
         pipeline: compileResult.pipeline,
-        prompt: userPrompt,
       });
 
-      if (onMessages) {
-        await onMessages(input);
-      }
       return {
         result: compileResult.pipeline,
         messages: input,

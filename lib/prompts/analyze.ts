@@ -173,6 +173,7 @@ Rules:
 - Only output selectors that EXIST and are entirely relevant to the prompt's objective.
 - You MUST NOT preform the action requested by the prompt, YOU ARE ONLY SUPPOSED TO ANALYZE.
 - You MUST NOT attempt to generate the pipeline itself.
+- Give up if you get the same error message (eg. the browser has been closed, frame detached, etc...) multiple times.
 
 When all the steps and selectors are known to generate the pipeline, return the output as soon as possible.
 

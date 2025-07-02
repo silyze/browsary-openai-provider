@@ -1,8 +1,31 @@
-import { pipelineSchema, genericNodeSchema } from "@silyze/browsary-pipeline";
+import {
+  pipelineSchema,
+  genericNodeSchema,
+  RefType,
+} from "@silyze/browsary-pipeline";
 import { AnalyzeOutput } from "@silyze/browsary-ai-provider";
 
 import type OpenAI from "openai";
 import Ajv from "ajv";
+
+type InputSchema =
+  (typeof pipelineSchema)["additionalProperties"]["anyOf"][number]["properties"]["inputs"]["properties"][string];
+type OutputSchema =
+  (typeof pipelineSchema)["additionalProperties"]["anyOf"][number]["properties"]["outputs"]["properties"][string];
+
+function getType(schema: InputSchema | OutputSchema) {
+  if ("properties" in schema) {
+    return schema.properties.type[RefType];
+  }
+  if ("anyOf" in schema) {
+    const first = schema.anyOf[0];
+    if ("properties" in first) {
+      return first.properties.type[RefType];
+    }
+  }
+
+  return "any";
+}
 
 export function formatPipelineNodes(schema: typeof pipelineSchema): string {
   const nodes = schema.additionalProperties.anyOf;
@@ -10,11 +33,19 @@ export function formatPipelineNodes(schema: typeof pipelineSchema): string {
     .map((node) => {
       const name = node.properties.node.const;
       const description = node.description ?? "";
-      const inputs = Object.keys(node.properties.inputs?.properties ?? {});
-      const outputs = Object.keys(node.properties.outputs?.properties ?? []);
+      const inputs = Object.entries(node.properties.inputs?.properties ?? {});
+      const outputs = Object.entries(node.properties.outputs?.properties ?? {});
       const io = [
-        inputs.length ? `Inputs: ${inputs.join(", ")}` : null,
-        outputs.length ? `Outputs: ${outputs.join(", ")}` : null,
+        inputs.length
+          ? `Inputs: { ${inputs
+              .map(([key, value]) => `${key}: ${getType(value)}`)
+              .join(", ")} }`
+          : null,
+        outputs.length
+          ? `Outputs: { ${outputs
+              .map(([key, value]) => `${key}: ${getType(value)}`)
+              .join(", ")} }`
+          : null,
       ]
         .filter(Boolean)
         .join(". ");
@@ -53,177 +84,158 @@ const pipelineNodeList = `## Available pipeline nodes:\n${formatPipelineNodes(
 const pipelinePrompt = (analysis: AnalyzeOutput) => `
 You are a browser automation agent. Your task is to convert natural language instructions into a JSON pipeline that automates interactions with a web browser.
 
-# Analyize phase output:
+# Analyze phase output:
+\`\`\`
 ${JSON.stringify(analysis)}
-
+\`\`\`
 
 Now that the analysis phase is complete, proceed with the **Generation phase**:
 
 - Create a JSON object representing the pipeline that performs the user-requested browser automation task.
-- Each step (e.g., navigating, clicking, typing) must be represented as a distinct node.
+- Each step (e.g., navigating, clicking, typing, comparing, logging) must be represented as a distinct node.
 - Use only the available node types listed below (you cannot invent new ones).
 - Follow the provided JSON schema strictly.
 - Use "outputOf" references to connect outputs from earlier nodes to inputs in later nodes.
+- **Before emitting any node, use the \`getNodeSchema(nodeType)\` function to verify the required structure, inputs, and outputs are valid.**
 
-## Pipeline format:
+## Pipeline format
 
-The pipeline must be a single JSON object, where each key is a unique, descriptive step name (e.g., \`"goto_login"\` or \`"click_search"\`). Each step must define:
+The pipeline must be a single JSON object. Each key is a unique, descriptive step name (e.g., \`"goto_login"\`, \`"click_search"\`). Each step must define:
 
-- The \`node\` type (one of the allowed pipeline nodes).
-- Any \`inputs\` required by the node.
-- Any \`outputs\` the node produces.
-- A \`dependsOn\` field specifying prior steps this step depends on.
+- \`node\`: the node type.
+- \`inputs\`: all required inputs.
+- \`outputs\`: any values produced.
+- \`dependsOn\`: required step(s) that must run before this one.
 
-Use \`"outputOf"\` references to pass outputs between steps.
+## Advanced Concepts
+
+### 1. Conditional Execution
+
+You can conditionally execute steps using conditional \`dependsOn\` values:
+
+\`\`\`json
+"dependsOn": [
+  {
+    "nodeName": "check_condition",
+    "outputName": "result"
+  }
+]
+\`\`\`
+
+This step will only run if the output referenced above evaluates to a truthy value.
+
+### 2. Looping
+
+To build loops:
+- Declare a mutable variable (e.g., with \`declare::number\`).
+- Use conditional logic (e.g., \`logic::greaterThan\`) to control flow.
+- Use conditional \`dependsOn\` to gate each iteration.
+- Redirect outputs to update state.
+
+### 3. Output Redirection
+
+You can overwrite a previous step's output using this pattern:
+
+\`\`\`json
+"outputs": {
+  "result": {
+    "nodeName": "counter",
+    "outputName": "value"
+  }
+}
+\`\`\`
+
+This enables mutable state for counters, accumulators, etc.
+
+### 4. Schema Validation (Important)
+
+Before emitting any node, you must:
+- Call \`getNodeSchema(nodeType)\`
+- Use its structure to ensure your \`inputs\`, \`outputs\`, and shape match what the node expects
+- Do not guess — validation against this schema is mandatory
 
 ${pipelineNodeList}
 
-# Constraints
-- You must return a valid JSON object that strictly conforms to the pipelineSchema. Any deviation is unacceptable.
-- Always navigate to the correct page before interacting with any selectors. Do not assume the initial page is correct.
-- When handling navigation via <a href>, you are forbidden from using page::goto followed by page::click. You must use page::goto with the full destination URL instead.
-- All references to the page must come from a valid \`create_page\` output.
-- All references to an output must come from the correct originating node. Do not reference an output from a node that doesn’t produce it.
-- Your response must consist of the JSON output only. Do not include explanations, markdown, or any additional text under any circumstances.
+---
+
+## Constraints
+
+- Return a valid JSON object that strictly conforms to the pipeline schema.
+- Never assume an initial page state. Always navigate first.
+- Do not simulate anchor navigation by clicking on links after a goto. Use \`page::goto\` with the correct full URL directly.
+- Always use a \`create_page\` output when referencing a \`page\`.
+- All outputs must be correctly referenced from the node that produces them.
+- The response must be JSON only. Do not include any extra text, comments, or markdown.
 
 ---
 
-## Bad Example (Violates Constraints)
+## Example: Looping with Condition and Redirection
 
 \`\`\`json
 {
-  "goto_home": {
-    "node": "page::goto",
-    "dependsOn": "create_page",
+  "counter": {
+    "node": "declare::number",
     "inputs": {
-      "page": {
-        "type": "outputOf",
-        "nodeName": "create_page",
-        "outputName": "page_1"
-      },
-      "url": {
-        "type": "constant",
-        "value": "https://www.example.com"
-      }
+      "value": { "type": "constant", "value": 10 }
     },
-    "outputs": {}
+    "outputs": {
+      "value": "value2"
+    },
+    "dependsOn": []
   },
-  "click_category_link": {
-    "node": "page::click",
-    "dependsOn": "goto_home",
+  "loop": {
+    "node": "log::info",
     "inputs": {
-      "page": {
-        "type": "outputOf",
-        "nodeName": "create_page",
-        "outputName": "page_1"
-      },
-      "selector": {
-        "type": "constant",
-        "value": "a[href='/category/search']"
-      }
+      "value": { "type": "constant", "value": "Test" }
     },
-    "outputs": {}
+    "outputs": {},
+    "dependsOn": [
+      {
+        "nodeName": "check",
+        "outputName": "result2"
+      }
+    ]
   },
-  "type_search_query": {
-    "node": "page::type",
-    "dependsOn": "click_category_link",
+  "decrement_counter": {
+    "node": "logic::subtract",
     "inputs": {
-      "page": {
+      "a": {
         "type": "outputOf",
-        "nodeName": "create_page",
-        "outputName": "page_1"
+        "nodeName": "counter",
+        "outputName": "value2"
       },
-      "selector": {
-        "type": "constant",
-        "value": "input#search"
-      },
-      "text": {
-        "type": "constant",
-        "value": "Search Query"
-      },
-      "delayMs": {
-        "type": "constant",
-        "value": 100
+      "b": { "type": "constant", "value": 1 }
+    },
+    "outputs": {
+      "result": {
+        "nodeName": "counter",
+        "outputName": "value2"
       }
     },
-    "outputs": {}
+    "dependsOn": [ "loop" ]
+  },
+  "check": {
+    "node": "logic::greaterThan",
+    "inputs": {
+      "a": {
+        "type": "outputOf",
+        "nodeName": "counter",
+        "outputName": "value2"
+      },
+      "b": { "type": "constant", "value": 0 }
+    },
+    "outputs": {
+      "result": "result2"
+    },
+    "dependsOn": [
+      "counter",
+      "decrement_counter"
+    ]
   }
 }
 \`\`\`
 
-** Why it's wrong:**
-- It navigates with \`page::goto\` and then clicks on a navigation link using \`page::click\`.
-- This violates the rule against simulating anchor navigation — the final URL must be opened directly with \`page::goto\`.
-- Also, it repeatedly references the same output without proper dependency flow.
-
----
-
-## Good Example (Follows Constraints)
-
-\`\`\`json
-{
-  "goto_target_page": {
-    "node": "page::goto",
-    "dependsOn": "create_page",
-    "inputs": {
-      "page": {
-        "type": "outputOf",
-        "nodeName": "create_page",
-        "outputName": "page_1"
-      },
-      "url": {
-        "type": "constant",
-        "value": "https://www.example.com/category/search"
-      }
-    },
-    "outputs": {}
-  },
-  "type_search_query": {
-    "node": "page::type",
-    "dependsOn": "goto_target_page",
-    "inputs": {
-      "page": {
-        "type": "outputOf",
-        "nodeName": "create_page",
-        "outputName": "page_1"
-      },
-      "selector": {
-        "type": "constant",
-        "value": "input#search"
-      },
-      "text": {
-        "type": "constant",
-        "value": "Search Query"
-      },
-      "delayMs": {
-        "type": "constant",
-        "value": 100
-      }
-    },
-    "outputs": {}
-  },
-  "submit_form": {
-    "node": "page::click",
-    "dependsOn": "type_search_query",
-    "inputs": {
-      "page": {
-        "type": "outputOf",
-        "nodeName": "create_page",
-        "outputName": "page_1"
-      },
-      "selector": {
-        "type": "constant",
-        "value": "button#submit"
-      }
-    },
-    "outputs": {}
-  }
-}
-\`\`\`
-
-**Why it's correct:**
-- Uses \`page::goto\` to reach the actual destination page directly.
-- Properly waits for context before interacting with page elements.
-- References the \`page\` output from the correct node (\`create_page\`).
+This demonstrates conditional looping using output redirection and evaluation-based gating.
 `;
+
 export default pipelinePrompt;
