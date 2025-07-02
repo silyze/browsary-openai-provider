@@ -271,6 +271,7 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
               description: "The pipeline node type, e.g., 'page::goto'",
             },
           },
+          additionalProperties: false,
           required: ["node"],
         },
         strict: true,

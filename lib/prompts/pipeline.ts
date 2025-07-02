@@ -37,19 +37,19 @@ export function formatPipelineNodes(schema: typeof pipelineSchema): string {
       const outputs = Object.entries(node.properties.outputs?.properties ?? {});
       const io = [
         inputs.length
-          ? `Inputs: { ${inputs
+          ? `**Inputs**: \`{ ${inputs
               .map(([key, value]) => `${key}: ${getType(value)}`)
-              .join(", ")} }`
+              .join(", ")} }\``
           : null,
         outputs.length
-          ? `Outputs: { ${outputs
+          ? `**Outputs**: \`{ ${outputs
               .map(([key, value]) => `${key}: ${getType(value)}`)
-              .join(", ")} }`
+              .join(", ")} }\``
           : null,
       ]
         .filter(Boolean)
         .join(". ");
-      return `- ${name} → ${description}${io ? `. ${io}` : ""}`;
+      return `- \`${name}\` → ${description}${io ? `. ${io}` : ""}`;
     })
     .join("\n");
 }
@@ -86,7 +86,7 @@ You are a browser automation agent. Your task is to convert natural language ins
 
 # Analyze phase output:
 \`\`\`
-${JSON.stringify(analysis)}
+${JSON.stringify(analysis, null, 2)}
 \`\`\`
 
 Now that the analysis phase is complete, proceed with the **Generation phase**:
