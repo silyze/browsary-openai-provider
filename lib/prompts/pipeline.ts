@@ -8,23 +8,24 @@ import { AnalyzeOutput } from "@silyze/browsary-ai-provider";
 import type OpenAI from "openai";
 import Ajv from "ajv";
 
-type InputSchema =
-  (typeof pipelineSchema)["additionalProperties"]["anyOf"][number]["properties"]["inputs"]["properties"][string];
-type OutputSchema =
-  (typeof pipelineSchema)["additionalProperties"]["anyOf"][number]["properties"]["outputs"]["properties"][string];
-
-function getType(schema: InputSchema | OutputSchema) {
-  if ("properties" in schema) {
-    return schema.properties.type[RefType];
+function getType(schema: object): string | undefined {
+  if (RefType in schema) {
+    return schema[RefType] as string;
   }
-  if ("anyOf" in schema) {
-    const first = schema.anyOf[0];
-    if ("properties" in first) {
-      return first.properties.type[RefType];
+
+  for (const entry in Object.entries(schema)) {
+    if (typeof entry !== "object") {
+      continue;
+    }
+
+    const type = getType(entry);
+
+    if (type !== undefined) {
+      return type;
     }
   }
 
-  return "any";
+  return undefined;
 }
 
 export function formatPipelineNodes(schema: typeof pipelineSchema): string {
@@ -38,12 +39,12 @@ export function formatPipelineNodes(schema: typeof pipelineSchema): string {
       const io = [
         inputs.length
           ? `**Inputs**: \`{ ${inputs
-              .map(([key, value]) => `${key}: ${getType(value)}`)
+              .map(([key, value]) => `${key}: ${getType(value) ?? "any"}`)
               .join(", ")} }\``
           : null,
         outputs.length
           ? `**Outputs**: \`{ ${outputs
-              .map(([key, value]) => `${key}: ${getType(value)}`)
+              .map(([key, value]) => `${key}: ${getType(value) ?? "any"}`)
               .join(", ")} }\``
           : null,
       ]

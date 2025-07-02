@@ -234,12 +234,6 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
     onMessages?: (message: unknown[]) => Promise<void> | void
   ): Promise<AiResult<Pipeline>> {
     const ai = await this.config.openAi;
-
-    this.config.logger.log("info", "generate", "Generation started", {
-      prompt: userPrompt,
-      analysis,
-    });
-
     const input: OpenAI.Responses.ResponseInput = [
       {
         role: "system",
@@ -279,26 +273,26 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
     ];
 
     let outputText = "";
+    let hasFunctionCalls = true;
+    let retryCount = 0;
 
-    const performPrompt = async () => {
+    while (outputText === "" && hasFunctionCalls) {
+      hasFunctionCalls = false;
+
       this.config.logger.log("debug", "generate", "Prompt started", {
         prompts: input.length,
       });
 
       try {
-        outputText = "";
-
-        if (onMessages) {
-          await onMessages(input);
-        }
+        if (onMessages) await onMessages(input);
 
         const response = await ai.responses.create({
           input,
           temperature: DEFAULT_TEMPERATURE,
           model: this.config.models?.generate ?? PIPELINE_GENERATE_MODEL,
-          text: pipelineOutput,
           tools,
           tool_choice: "auto",
+          text: pipelineOutput,
         });
 
         outputText = response.output_text ?? "";
@@ -312,8 +306,11 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
 
         for (const item of response.output) {
           input.push(item);
+          if (onMessages) await onMessages(input);
 
           if (item.type === "function_call" && item.call_id) {
+            hasFunctionCalls = true;
+
             try {
               const params = JSON.parse(item.arguments);
               this.config.logger.log(
@@ -344,6 +341,7 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
                 call_id: item.call_id,
                 output: JSON.stringify(nodeSchema),
               });
+
               if (onMessages) await onMessages(input);
             } catch (e: any) {
               this.config.logger.log(
@@ -361,33 +359,26 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
                 call_id: item.call_id,
                 output: `Error while executing function: ${e.message}`,
               });
+
+              if (onMessages) await onMessages(input);
             }
           }
         }
-
-        if (onMessages) await onMessages(input);
       } catch (e: any) {
         this.config.logger.log("error", "generate", "Prompt failed", {
           error: createErrorObject(e),
         });
-      }
-    };
 
-    await performPrompt();
-
-    let retryCount = 0;
-
-    do {
-      if (retryCount >= MAX_RESPONSE_FIX_RETRY) {
-        const e = new Error(
-          `Exceeded maximum retries (${MAX_RESPONSE_FIX_RETRY}) while validating pipeline response.`
-        );
-        this.config.logger.log("error", "generate", "Max retry reached", {
-          error: createErrorObject(e),
-        });
+        if (onMessages) await onMessages(input);
         return { messages: input };
       }
+    }
 
+    this.config.logger.log("debug", "generate", "Final output text", {
+      outputText,
+    });
+
+    for (; retryCount < MAX_RESPONSE_FIX_RETRY; retryCount++) {
       let responseObject: unknown;
 
       try {
@@ -409,8 +400,8 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
           }),
         });
 
-        retryCount++;
-        await performPrompt();
+        outputText = "";
+        hasFunctionCalls = false;
         continue;
       }
 
@@ -433,13 +424,14 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
           }),
         });
 
-        retryCount++;
-        await performPrompt();
+        outputText = "";
+        hasFunctionCalls = false;
         continue;
       }
 
       const compileResult =
         this.config.pipelineProvider.compile(responseObject);
+
       if (!hasPipeline(compileResult)) {
         this.config.logger.log("error", "generate", "Compilation failed", {
           errors: compileResult.errors,
@@ -454,8 +446,8 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
           }),
         });
 
-        retryCount++;
-        await performPrompt();
+        outputText = "";
+        hasFunctionCalls = false;
         continue;
       }
 
@@ -467,6 +459,15 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
         result: compileResult.pipeline,
         messages: input,
       };
-    } while (true);
+    }
+
+    const error = new Error(
+      `Exceeded maximum retries (${MAX_RESPONSE_FIX_RETRY}) while validating pipeline response.`
+    );
+    this.config.logger.log("error", "generate", "Max retry reached", {
+      error: createErrorObject(error),
+    });
+
+    return { messages: input };
   }
 }
