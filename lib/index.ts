@@ -291,7 +291,6 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
           temperature: DEFAULT_TEMPERATURE,
           model: this.config.models?.generate ?? PIPELINE_GENERATE_MODEL,
           tools,
-          tool_choice: "auto",
           text: pipelineOutput,
         });
 
