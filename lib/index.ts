@@ -283,6 +283,13 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
         prompts: input.length,
       });
 
+      this.config.logger.log(
+        "debug",
+        "generate",
+        "Output schema",
+        pipelineOutput
+      );
+
       try {
         if (onMessages) await onMessages(input);
 
