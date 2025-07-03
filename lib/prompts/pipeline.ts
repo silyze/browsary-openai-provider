@@ -8,20 +8,33 @@ import { AnalyzeOutput } from "@silyze/browsary-ai-provider";
 import type OpenAI from "openai";
 import Ajv from "ajv";
 
-function getType(schema: object): string | undefined {
-  if (typeof (schema as any)[RefType] === "string") {
-    return (schema as any)[RefType] as string;
+function getType(schema: unknown): string | undefined {
+  if (typeof schema !== "object" || schema === null) {
+    return undefined;
   }
 
-  for (const entry in Object.entries(schema)) {
-    if (typeof entry !== "object") {
-      continue;
-    }
+  if (RefType in schema && typeof (schema as any)[RefType] === "string") {
+    return (schema as any)[RefType];
+  }
 
-    const type = getType(entry);
+  const entries = [
+    ...Object.values(schema as Record<string, unknown>),
+    ...Object.getOwnPropertySymbols(schema).map((sym) => (schema as any)[sym]),
+  ];
 
-    if (type !== undefined) {
-      return type;
+  for (const value of entries) {
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const type = getType(item);
+        if (type !== undefined) {
+          return type;
+        }
+      }
+    } else if (typeof value === "object" && value !== null) {
+      const type = getType(value);
+      if (type !== undefined) {
+        return type;
+      }
     }
   }
 
