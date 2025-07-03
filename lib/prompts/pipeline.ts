@@ -9,8 +9,8 @@ import type OpenAI from "openai";
 import Ajv from "ajv";
 
 function getType(schema: object): string | undefined {
-  if (RefType in schema) {
-    return schema[RefType] as string;
+  if (typeof (schema as any)[RefType] === "string") {
+    return (schema as any)[RefType] as string;
   }
 
   for (const entry in Object.entries(schema)) {
