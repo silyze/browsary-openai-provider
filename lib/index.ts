@@ -27,7 +27,6 @@ import {
 import { assert } from "@mojsoski/assert";
 import { OpenAiModel } from "./model";
 import { DEFAULT_TEMPERATURE, MAX_RESPONSE_FIX_RETRY } from "./defaults";
-import { FunctionTool } from "../node_modules/openai/src/resources/responses/responses";
 
 export type OpenAiConfig = {
   openAi: OpenAI | Promise<OpenAI>;
@@ -97,11 +96,11 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
   }
 
   async #retryUntilValidResponse(
-    page: Page,
     input: OpenAI.Responses.ResponseInput,
     config: {
+      toolsAvailableRef: { value: boolean };
       model: string;
-      tools: FunctionTool[];
+      tools?: OpenAI.Responses.FunctionTool[];
       text: OpenAI.Responses.ResponseTextConfig;
       onMessages?: (messages: unknown[]) => Promise<void> | void;
       handleFunctionCall: (
@@ -174,7 +173,8 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
     input: OpenAI.Responses.ResponseInput,
     config: {
       model: string;
-      tools: FunctionTool[];
+      toolsAvailableRef: { value: boolean };
+      tools?: OpenAI.Responses.FunctionTool[];
       text: OpenAI.Responses.ResponseTextConfig;
       onMessages?: (messages: unknown[]) => Promise<void> | void;
       handleFunctionCall?: (
@@ -184,7 +184,14 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
     }
   ): Promise<{ outputText: string; messages: OpenAI.Responses.ResponseInput }> {
     const ai = await this.config.openAi;
-    const { model, tools, text, onMessages, handleFunctionCall } = config;
+    const {
+      model,
+      tools,
+      text,
+      onMessages,
+      handleFunctionCall,
+      toolsAvailableRef,
+    } = config;
 
     let outputText = "";
     let hasFunctionCalls = true;
@@ -203,7 +210,7 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
           input,
           temperature: DEFAULT_TEMPERATURE,
           model,
-          tools,
+          tools: toolsAvailableRef.value ? tools : undefined,
           text,
         });
 
@@ -279,6 +286,7 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
     const { outputText, messages } = await this.#runWithPromptAndFunctionCalls(
       input,
       {
+        toolsAvailableRef: { value: true },
         model: this.config.models?.analyze ?? ANALYZE_MODEL,
         tools: analyzeTools,
         text: {
@@ -348,7 +356,7 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
       },
     ];
 
-    const tools: FunctionTool[] = [
+    const tools: OpenAI.Responses.FunctionTool[] = [
       {
         type: "function",
         name: "getNodeSchema",
@@ -368,20 +376,32 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
 
     const seenSchemas = new Set<string>();
 
-    return this.#retryUntilValidResponse(page, input, {
+    const toolsAvailableRef = { value: true };
+
+    return this.#retryUntilValidResponse(input, {
       model: this.config.models?.generate ?? PIPELINE_GENERATE_MODEL,
       tools,
       text: pipelineOutput,
+      toolsAvailableRef,
       onMessages,
       handleFunctionCall: async (item, input) => {
         const params = JSON.parse(item.arguments);
         const nodeName = params.node as `${string}::${string}`;
-
+        if (typeof nodeName !== "string" || !nodeName.includes("::")) {
+          throw new TypeError(`Invalid node name format: ${nodeName}`);
+        }
         if (seenSchemas.has(nodeName)) {
           this.#addSystemMessage(input, {
             type: "redundant-tool-call",
             message: `⚠️ Schema for "${nodeName}" was already retrieved. Continue with generation.`,
           });
+
+          input.push({
+            type: "function_call_output",
+            call_id: item.call_id,
+            output: JSON.stringify(null),
+          });
+
           return;
         }
         seenSchemas.add(nodeName);
@@ -415,6 +435,7 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
             message:
               "✅ You have retrieved enough node schemas. Now begin generating the final pipeline JSON that fulfills the user's prompt.",
           });
+          toolsAvailableRef.value = false;
         }
       },
       validate: validatePipelineSchema,
