@@ -20,6 +20,7 @@ import {
   GenericNode,
   hasPipeline,
   Pipeline,
+  PipelineCompileResult,
   PipelineProvider,
   pipelineSchema,
 } from "@silyze/browsary-pipeline";
@@ -79,6 +80,178 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
     };
   }
 
+  #safeJsonParse(text: string): unknown | undefined {
+    try {
+      return JSON.parse(text);
+    } catch {
+      return undefined;
+    }
+  }
+
+  #addSystemMessage(input: OpenAI.Responses.ResponseInput, payload: unknown) {
+    input.push({
+      type: "message",
+      role: "system",
+      content: JSON.stringify(payload),
+    });
+  }
+
+  async #retryUntilValidResponse(
+    page: Page,
+    input: OpenAI.Responses.ResponseInput,
+    config: {
+      model: string;
+      tools: FunctionTool[];
+      text: OpenAI.Responses.ResponseTextConfig;
+      onMessages?: (messages: unknown[]) => Promise<void> | void;
+      handleFunctionCall: (
+        item: OpenAI.Responses.ResponseFunctionToolCall,
+        input: OpenAI.Responses.ResponseInput
+      ) => Promise<void>;
+      validate: (json: unknown) => boolean;
+      compile: (json: unknown) => PipelineCompileResult;
+      errorTypes: {
+        parse: string;
+        validate: string;
+        compile: string;
+      };
+    }
+  ): Promise<AiResult<Pipeline>> {
+    let retryCount = 0;
+
+    while (retryCount < MAX_RESPONSE_FIX_RETRY) {
+      const { outputText, messages } =
+        await this.#runWithPromptAndFunctionCalls(input, config);
+
+      if (!outputText) return { messages };
+
+      const parsed = this.#safeJsonParse(outputText);
+      if (!parsed) {
+        this.#addSystemMessage(input, {
+          type: config.errorTypes.parse,
+          message: "Failed to parse the JSON response",
+        });
+        retryCount++;
+        continue;
+      }
+
+      if (!config.validate(parsed)) {
+        this.#addSystemMessage(input, {
+          type: config.errorTypes.validate,
+          errors: getPipelineValidationErrors(),
+        });
+        retryCount++;
+        continue;
+      }
+
+      const result = config.compile(parsed);
+      if (!hasPipeline(result)) {
+        this.#addSystemMessage(input, {
+          type: config.errorTypes.compile,
+          errors: result.errors,
+        });
+        retryCount++;
+        continue;
+      }
+
+      return {
+        result: result.pipeline!,
+        messages,
+      };
+    }
+
+    const error = new Error(
+      `Exceeded maximum retries (${MAX_RESPONSE_FIX_RETRY}) while validating response.`
+    );
+    this.config.logger.log("error", config.model, "Max retry reached", {
+      error: createErrorObject(error),
+    });
+
+    return { messages: input };
+  }
+
+  async #runWithPromptAndFunctionCalls<T>(
+    input: OpenAI.Responses.ResponseInput,
+    config: {
+      model: string;
+      tools: FunctionTool[];
+      text: OpenAI.Responses.ResponseTextConfig;
+      onMessages?: (messages: unknown[]) => Promise<void> | void;
+      handleFunctionCall?: (
+        item: OpenAI.Responses.ResponseFunctionToolCall,
+        input: OpenAI.Responses.ResponseInput
+      ) => Promise<void>;
+    }
+  ): Promise<{ outputText: string; messages: OpenAI.Responses.ResponseInput }> {
+    const ai = await this.config.openAi;
+    const { model, tools, text, onMessages, handleFunctionCall } = config;
+
+    let outputText = "";
+    let hasFunctionCalls = true;
+
+    while (outputText === "" && hasFunctionCalls) {
+      hasFunctionCalls = false;
+
+      this.config.logger.log("debug", model, "Prompt started", {
+        prompts: input.length,
+      });
+
+      try {
+        if (onMessages) await onMessages(input);
+
+        const response = await ai.responses.create({
+          input,
+          temperature: DEFAULT_TEMPERATURE,
+          model,
+          tools,
+          text,
+        });
+
+        outputText = response.output_text ?? "";
+        this.config.logger.log(
+          "debug",
+          model,
+          "Prompt completed",
+          response.output
+        );
+
+        for (const item of response.output) {
+          input.push(item);
+          if (onMessages) await onMessages(input);
+
+          if (
+            item.type === "function_call" &&
+            item.call_id &&
+            handleFunctionCall
+          ) {
+            hasFunctionCalls = true;
+            try {
+              await handleFunctionCall(item, input);
+              if (onMessages) await onMessages(input);
+            } catch (e: any) {
+              this.config.logger.log("error", model, "Function call failed", {
+                name: item.name,
+                error: createErrorObject(e),
+              });
+              input.push({
+                type: "function_call_output",
+                call_id: item.call_id,
+                output: `Error while executing function: ${e.message}`,
+              });
+              if (onMessages) await onMessages(input);
+            }
+          }
+        }
+      } catch (e: any) {
+        this.config.logger.log("error", model, "Prompt failed", {
+          error: createErrorObject(e),
+        });
+        break;
+      }
+    }
+
+    return { outputText, messages: input };
+  }
   public async analyze(
     page: Page,
     userPrompt: string,
@@ -88,11 +261,9 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
     this.config.logger.log("info", "analyze", "Analysis started", {
       prompt: userPrompt,
     });
+
     const input: OpenAI.Responses.ResponseInput = [
-      {
-        role: "system",
-        content: analyzePrompt,
-      },
+      { role: "system", content: analyzePrompt },
       {
         role: "system",
         content: `Previous pipeline version:\n ${JSON.stringify(
@@ -105,140 +276,66 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
       },
     ];
 
-    let outputText = "";
-
-    outputText = "";
-    let hasFunctionCalls = true;
-
-    while (outputText === "" && hasFunctionCalls) {
-      hasFunctionCalls = false;
-      this.config.logger.log("debug", "analyze", "Prompt started", {
-        prompts: input.length,
-      });
-
-      try {
-        if (onMessages) {
-          await onMessages(input);
-        }
-        const response = await (
-          await this.config.openAi
-        ).responses.create({
-          input,
-          temperature: DEFAULT_TEMPERATURE,
-          model: this.config.models?.analyze ?? ANALYZE_MODEL,
-          tools: analyzeTools,
-          text: {
-            format: {
-              type: "json_schema",
-              name: "analysis",
-              schema: analyzeOutputSchema,
-              strict: true,
-            },
+    const { outputText, messages } = await this.#runWithPromptAndFunctionCalls(
+      input,
+      {
+        model: this.config.models?.analyze ?? ANALYZE_MODEL,
+        tools: analyzeTools,
+        text: {
+          format: {
+            type: "json_schema",
+            name: "analysis",
+            schema: analyzeOutputSchema,
+            strict: true,
           },
-        });
-        outputText = response.output_text ?? "";
-        this.config.logger.log(
-          "debug",
-          "analyze",
-          "Prompt completed",
-          response.output
-        );
-        for (const item of response.output) {
-          input.push(item);
-
-          if (onMessages) {
-            await onMessages(input);
-          }
-          if (item.type === "function_call" && item.call_id) {
-            hasFunctionCalls = true;
-
-            try {
-              const params = JSON.parse(item.arguments);
-
-              this.config.logger.log(
-                "debug",
-                "analyze",
-                "Function call started",
-                { name: item.name, params }
-              );
-              const result = await this.functionCall(page, item.name, params);
-
-              this.config.logger.log(
-                "debug",
-                "analyze",
-                "Function call ended",
-                { name: item.name, params }
-              );
-
-              input.push({
-                type: "function_call_output",
-                call_id: item.call_id,
-                output: JSON.stringify(result ?? {}),
-              });
-              if (onMessages) {
-                await onMessages(input);
-              }
-            } catch (e: any) {
-              this.config.logger.log(
-                "error",
-                "analyze",
-                "Function call failed",
-                { name: item.name, error: createErrorObject(e) }
-              );
-              input.push({
-                type: "function_call_output",
-                call_id: item.call_id,
-                output: `Error while executing function: ${e.message}`,
-              });
-
-              if (onMessages) {
-                await onMessages(input);
-              }
-            }
-          }
-        }
-      } catch (e: any) {
-        this.config.logger.log("error", "analyze", "Prompt failed", {
-          error: createErrorObject(e),
-        });
-
-        this.config.logger.log("error", "analyze", "Analysis failed", {
-          prompt: userPrompt,
-        });
-
-        if (onMessages) {
-          await onMessages(input);
-        }
-        return {
-          messages: input,
-        };
+        },
+        onMessages,
+        handleFunctionCall: async (item, input) => {
+          const params = JSON.parse(item.arguments);
+          this.config.logger.log("debug", "analyze", "Function call started", {
+            name: item.name,
+            params,
+          });
+          const result = await this.functionCall(page, item.name, params);
+          this.config.logger.log("debug", "analyze", "Function call ended", {
+            name: item.name,
+            params,
+          });
+          input.push({
+            type: "function_call_output",
+            call_id: item.call_id,
+            output: JSON.stringify(result ?? {}),
+          });
+        },
       }
+    );
+
+    if (!outputText) {
+      this.config.logger.log("error", "analyze", "Analysis failed", {
+        prompt: userPrompt,
+      });
+      return { messages };
     }
+
     this.config.logger.log("info", "analyze", "Analysis ended", {
       analysis: outputText,
       prompt: userPrompt,
     });
 
-    if (onMessages) {
-      await onMessages(input);
-    }
     return {
       result: { analysis: JSON.parse(outputText), prompt: userPrompt },
-      messages: input,
+      messages,
     };
   }
+
   public async generate(
     page: Page,
     { analysis, prompt: userPrompt }: AnalysisResult,
     previousPipeline: Record<string, GenericNode>,
     onMessages?: (message: unknown[]) => Promise<void> | void
   ): Promise<AiResult<Pipeline>> {
-    const ai = await this.config.openAi;
     const input: OpenAI.Responses.ResponseInput = [
-      {
-        role: "system",
-        content: pipelinePrompt(analysis),
-      },
+      { role: "system", content: pipelinePrompt(analysis) },
       {
         role: "system",
         content: `Previous pipeline version:\n ${JSON.stringify(
@@ -260,220 +357,47 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
         parameters: {
           type: "object",
           properties: {
-            node: {
-              type: "string",
-              description: "The pipeline node type, e.g., 'page::goto'",
-            },
+            node: { type: "string", description: "e.g. 'page::goto'" },
           },
-          additionalProperties: false,
           required: ["node"],
+          additionalProperties: false,
         },
         strict: true,
       },
     ];
 
-    let outputText = "";
-    let hasFunctionCalls = true;
-    let retryCount = 0;
-
-    while (outputText === "" && hasFunctionCalls) {
-      hasFunctionCalls = false;
-
-      this.config.logger.log("debug", "generate", "Prompt started", {
-        prompts: input.length,
-      });
-
-      this.config.logger.log(
-        "debug",
-        "generate",
-        "Output schema",
-        pipelineOutput
-      );
-
-      try {
-        if (onMessages) await onMessages(input);
-
-        const response = await ai.responses.create({
-          input,
-          temperature: DEFAULT_TEMPERATURE,
-          model: this.config.models?.generate ?? PIPELINE_GENERATE_MODEL,
-          tools,
-          text: pipelineOutput,
-        });
-
-        outputText = response.output_text ?? "";
-
-        this.config.logger.log(
-          "debug",
-          "generate",
-          "Prompt completed",
-          response.output
-        );
-
-        for (const item of response.output) {
-          input.push(item);
-          if (onMessages) await onMessages(input);
-
-          if (item.type === "function_call" && item.call_id) {
-            hasFunctionCalls = true;
-
-            try {
-              const params = JSON.parse(item.arguments);
-              this.config.logger.log(
-                "debug",
-                "generate",
-                "Function call started",
-                {
-                  name: item.name,
-                  params,
-                }
-              );
-
-              if (item.name !== "getNodeSchema") {
-                throw new TypeError(`Invalid function name: ${item.name}`);
-              }
-
-              const nodeName = params.node as `${string}::${string}`;
-              const nodeSchema = pipelineSchema.additionalProperties.anyOf.find(
-                (item) => item.properties.node.const === nodeName
-              );
-
-              if (!nodeSchema) {
-                throw new TypeError(`Node schema was not found`);
-              }
-
-              input.push({
-                type: "function_call_output",
-                call_id: item.call_id,
-                output: JSON.stringify(nodeSchema),
-              });
-
-              if (onMessages) await onMessages(input);
-            } catch (e: any) {
-              this.config.logger.log(
-                "error",
-                "generate",
-                "Function call failed",
-                {
-                  name: item.name,
-                  error: createErrorObject(e),
-                }
-              );
-
-              input.push({
-                type: "function_call_output",
-                call_id: item.call_id,
-                output: `Error while executing function: ${e.message}`,
-              });
-
-              if (onMessages) await onMessages(input);
-            }
-          }
+    return this.#retryUntilValidResponse(page, input, {
+      model: this.config.models?.generate ?? PIPELINE_GENERATE_MODEL,
+      tools,
+      text: pipelineOutput,
+      onMessages,
+      handleFunctionCall: async (item, input) => {
+        const params = JSON.parse(item.arguments);
+        if (item.name !== "getNodeSchema") {
+          throw new TypeError(`Invalid function name: ${item.name}`);
         }
-      } catch (e: any) {
-        this.config.logger.log("error", "generate", "Prompt failed", {
-          error: createErrorObject(e),
-        });
 
-        if (onMessages) await onMessages(input);
-        return { messages: input };
-      }
-    }
-
-    this.config.logger.log("debug", "generate", "Final output text", {
-      outputText,
-    });
-
-    for (; retryCount < MAX_RESPONSE_FIX_RETRY; retryCount++) {
-      let responseObject: unknown;
-
-      try {
-        responseObject = JSON.parse(outputText);
-      } catch {
-        this.config.logger.log(
-          "error",
-          "generate",
-          "Failed to parse the JSON response",
-          { text: outputText }
+        const nodeName = params.node as `${string}::${string}`;
+        const nodeSchema = pipelineSchema.additionalProperties.anyOf.find(
+          (s) => s.properties.node.const === nodeName
         );
+        if (!nodeSchema) {
+          throw new TypeError(`Node schema was not found`);
+        }
 
         input.push({
-          type: "message",
-          role: "system",
-          content: JSON.stringify({
-            type: "parse-error",
-            message: "Failed to parse the JSON response",
-          }),
+          type: "function_call_output",
+          call_id: item.call_id,
+          output: JSON.stringify(nodeSchema),
         });
-
-        outputText = "";
-        hasFunctionCalls = false;
-        continue;
-      }
-
-      if (!validatePipelineSchema(responseObject)) {
-        this.config.logger.log(
-          "error",
-          "generate",
-          "Schema validation failed",
-          {
-            errors: getPipelineValidationErrors(),
-          }
-        );
-
-        input.push({
-          type: "message",
-          role: "system",
-          content: JSON.stringify({
-            type: "validate-error",
-            errors: getPipelineValidationErrors(),
-          }),
-        });
-
-        outputText = "";
-        hasFunctionCalls = false;
-        continue;
-      }
-
-      const compileResult =
-        this.config.pipelineProvider.compile(responseObject);
-
-      if (!hasPipeline(compileResult)) {
-        this.config.logger.log("error", "generate", "Compilation failed", {
-          errors: compileResult.errors,
-        });
-
-        input.push({
-          type: "message",
-          role: "system",
-          content: JSON.stringify({
-            type: "pipeline-compile-errors",
-            errors: compileResult.errors,
-          }),
-        });
-
-        outputText = "";
-        hasFunctionCalls = false;
-        continue;
-      }
-
-      this.config.logger.log("info", "generate", "Generation successful", {
-        pipeline: compileResult.pipeline,
-      });
-
-      return {
-        result: compileResult.pipeline,
-        messages: input,
-      };
-    }
-
-    const error = new Error(
-      `Exceeded maximum retries (${MAX_RESPONSE_FIX_RETRY}) while validating pipeline response.`
-    );
-    this.config.logger.log("error", "generate", "Max retry reached", {
-      error: createErrorObject(error),
+      },
+      validate: validatePipelineSchema,
+      compile: (json) => this.config.pipelineProvider.compile(json),
+      errorTypes: {
+        parse: "parse-error",
+        validate: "validate-error",
+        compile: "pipeline-compile-errors",
+      },
     });
-
-    return { messages: input };
   }
 }
