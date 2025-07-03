@@ -180,6 +180,8 @@ ${pipelineNodeList}
 - Always use a \`create_page\` output when referencing a \`page\`.
 - All outputs must be correctly referenced from the node that produces them.
 - The response must be JSON only. Do not include any extra text, comments, or markdown.
+- Once you have used \`getNodeSchema(nodeType)\` for each node you plan to emit, you must construct and return the full pipeline JSON immediately.
+- Do not call \`getNodeSchema\` more than once per node type.
 
 ---
 
