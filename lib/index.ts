@@ -366,6 +366,8 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
       },
     ];
 
+    const seenSchemas = new Set<string>();
+
     return this.#retryUntilValidResponse(page, input, {
       model: this.config.models?.generate ?? PIPELINE_GENERATE_MODEL,
       tools,
@@ -373,16 +375,23 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
       onMessages,
       handleFunctionCall: async (item, input) => {
         const params = JSON.parse(item.arguments);
-        if (item.name !== "getNodeSchema") {
-          throw new TypeError(`Invalid function name: ${item.name}`);
-        }
-
         const nodeName = params.node as `${string}::${string}`;
+
+        if (seenSchemas.has(nodeName)) {
+          this.#addSystemMessage(input, {
+            type: "redundant-tool-call",
+            message: `⚠️ Schema for "${nodeName}" was already retrieved. Continue with generation.`,
+          });
+          return;
+        }
+        seenSchemas.add(nodeName);
+
         const nodeSchema = pipelineSchema.additionalProperties.anyOf.find(
           (s) => s.properties.node.const === nodeName
         );
+
         if (!nodeSchema) {
-          throw new TypeError(`Node schema was not found`);
+          throw new TypeError(`Node schema for "${nodeName}" was not found`);
         }
 
         input.push({
@@ -390,6 +399,23 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
           call_id: item.call_id,
           output: JSON.stringify(nodeSchema),
         });
+
+        if (
+          input.filter((m) => m.type === "function_call_output").length >= 10 &&
+          !input.some(
+            (m) =>
+              m.type === "message" &&
+              m.role === "system" &&
+              typeof m.content === "string" &&
+              m.content.includes("begin generating")
+          )
+        ) {
+          this.#addSystemMessage(input, {
+            type: "tool-phase-complete",
+            message:
+              "✅ You have retrieved enough node schemas. Now begin generating the final pipeline JSON that fulfills the user's prompt.",
+          });
+        }
       },
       validate: validatePipelineSchema,
       compile: (json) => this.config.pipelineProvider.compile(json),
