@@ -169,7 +169,7 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
     return { messages: input };
   }
 
-  async #runWithPromptAndFunctionCalls<T>(
+  async #runWithPromptAndFunctionCalls(
     input: OpenAI.Responses.ResponseInput,
     config: {
       model: string;
@@ -422,13 +422,7 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
 
         if (
           input.filter((m) => m.type === "function_call_output").length >= 10 &&
-          !input.some(
-            (m) =>
-              m.type === "message" &&
-              m.role === "system" &&
-              typeof m.content === "string" &&
-              m.content.includes("begin generating")
-          )
+          !hasToolPhaseComplete(input)
         ) {
           this.#addSystemMessage(input, {
             type: "tool-phase-complete",
@@ -447,4 +441,21 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
       },
     });
   }
+}
+
+function hasToolPhaseComplete(input: OpenAI.Responses.ResponseInput): boolean {
+  return input.some(
+    (m) =>
+      m.type === "message" &&
+      m.role === "system" &&
+      typeof m.content === "string" &&
+      (() => {
+        try {
+          const payload = JSON.parse(m.content);
+          return payload?.type === "tool-phase-complete";
+        } catch {
+          return false;
+        }
+      })()
+  );
 }
