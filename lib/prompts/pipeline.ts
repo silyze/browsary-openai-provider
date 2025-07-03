@@ -73,7 +73,7 @@ export const pipelineOutput = {
     type: "json_schema",
     name: "pipeline",
     schema: genericNodeSchema,
-    strict: true,
+    strict: false,
   },
 } as const;
 const ajv = new Ajv();
