@@ -1,14 +1,17 @@
 {
   "name": "@silyze/browsary-openai-provider",
-  "version": "1.1.17",
+  "version": "1.1.18",
   "description": "OpenAI provider for @silyze/browsary-ai-provider",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "dist/lib/index.js",
+  "types": "dist/lib/index.d.ts",
   "keywords": [],
   "author": "Mihail Mojsoski",
   "license": "MIT",
   "type": "commonjs",
   "devDependencies": {
+    "@silyze/browsary-pipeline-agent": "^1.0.0",
+    "dotenv": "^17.2.0",
+    "puppeteer": "^24.12.1",
     "typescript": "^5.8.3"
   },
   "scripts": {
@@ -16,7 +19,8 @@
     "build": "npx tsc",
     "prepare": "npm run build",
     "version": "git add -A lib",
-    "postversion": "git push && git push --tags"
+    "postversion": "git push && git push --tags",
+    "start:example": "npm run build && node dist/src/example.js"
   },
   "publishConfig": {
     "access": "public"
