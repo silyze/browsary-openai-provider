@@ -1,11 +1,12 @@
 import OpenAI from "openai";
-import { DEFAULT_TEMPERATURE, MAX_RESPONSE_FIX_RETRY } from "./defaults";
+import { MAX_RESPONSE_FIX_RETRY } from "./defaults";
 import { assert } from "@mojsoski/assert";
 import {
   AiModel,
   AiProvider,
   AiResult,
   AnalysisResult,
+  UsageMonitor,
 } from "@silyze/browsary-ai-provider";
 import analyzePrompt, { analyzeOutputSchema } from "./prompts/analyze";
 import { ANALYZE_MODEL, analyzeTools } from "./prompts/analyze";
@@ -52,17 +53,23 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
       this.config.logger.createScope(model),
       model,
       this.config,
-      context
+      context,
+      {
+        emitStart: (base) => this.emitStart(base),
+        emitEnd: (base, started) => this.emitEnd(base, started),
+      }
     );
   }
 
   constructor(
     config: OpenAiConfig,
-    functionCall: (ctx: Page, name: string, params: any) => Promise<unknown>
+    functionCall: (ctx: Page, name: string, params: any) => Promise<unknown>,
+    monitor?: UsageMonitor
   ) {
     super(
       { ...config, logger: config.logger.createScope("openai") },
-      functionCall
+      functionCall,
+      monitor
     );
 
     const analyzeModel = config.models?.analyze ?? ANALYZE_MODEL;
@@ -120,7 +127,15 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
       },
     };
 
-    const functionCallRef = this.functionCall;
+    const start = this.emitStart({
+      source: "pipeline.analyze",
+      model: promptConfig.model,
+      metadata: {
+        promptLength: userPrompt.length,
+      },
+    });
+
+    const functionCallRef = this.callFunctionWithTelemetry.bind(this);
     const functionsConfig: FunctionConfiguration = {
       tools: analyzeTools,
       async handle(call) {
@@ -138,29 +153,41 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
       logger: this.config.logger.createScope(promptConfig.model),
     });
 
-    let calls = 0;
-    for await (const _ of convo.start()) {
-      if (calls++ > 30) {
-        convo.clearTools();
+    try {
+      let calls = 0;
+      for await (const _ of convo.start()) {
+        if (calls++ > 30) {
+          convo.clearTools();
+        }
       }
-    }
 
-    const output = convo.output;
-    const messages = convo.history;
-    if (!output) {
-      this.config.logger.log("error", "analyze", "Analysis failed", {
+      const output = convo.output;
+      const messages = convo.history;
+      if (!output) {
+        this.config.logger.log("error", "analyze", "Analysis failed", {
+          prompt: userPrompt,
+        });
+        return { messages };
+      }
+
+      const analysis = JSON.parse(output) as AnalysisResult["analysis"];
+      this.config.logger.log("info", "analyze", "Analysis ended", {
+        analysis,
         prompt: userPrompt,
       });
-      return { messages };
+
+      return { result: { analysis, prompt: userPrompt }, messages };
+    } finally {
+      this.emitEnd({
+        source: "pipeline.analyze",
+        model: promptConfig.model,
+        startedAt: start.startedAt,
+        metadata: {
+          promptLength: userPrompt.length,
+        },
+        usage: convo.usage,
+      });
     }
-
-    const analysis = JSON.parse(output) as AnalysisResult["analysis"];
-    this.config.logger.log("info", "analyze", "Analysis ended", {
-      analysis,
-      prompt: userPrompt,
-    });
-
-    return { result: { analysis, prompt: userPrompt }, messages };
   }
 
   public async generate(
@@ -189,6 +216,14 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
       ],
       text: pipelineOutput,
     };
+
+    const start = this.emitStart({
+      source: "pipeline.generate",
+      model: promptConfig.model,
+      metadata: {
+        promptLength: userPrompt.length,
+      },
+    });
 
     let convo: Conversation | undefined = undefined;
 
@@ -248,50 +283,62 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
       logger: this.config.logger.createScope(promptConfig.model),
     });
 
-    while (retryCount < MAX_RESPONSE_FIX_RETRY) {
-      for await (const _ of convo.start()) {
-      }
-
-      const output = convo.output;
-      if (output) {
-        try {
-          const parsed = JSON.parse(output);
-          if (!validatePipelineSchema(parsed)) {
-            const errs = getPipelineValidationErrors();
-            throw new Error(`Validation errors: ${errs?.join(", ")}`);
-          }
-          const compiled = this.config.pipelineProvider.compile(parsed);
-          if (!hasPipeline(compiled)) {
-            throw new Error(
-              `Compile errors: ${compiled.errors
-                .map((item) => JSON.stringify(item))
-                .join(", ")}`
-            );
-          }
-          return { result: compiled.pipeline!, messages: convo.history };
-        } catch (e: any) {
-          convo.clearOutput();
-          convo.add({
-            type: "message",
-            role: "system",
-            content: JSON.stringify({
-              type: "pipeline-error",
-              message: e.message,
-            }),
-          });
+    try {
+      while (retryCount < MAX_RESPONSE_FIX_RETRY) {
+        for await (const _ of convo.start()) {
         }
-      } else {
-        this.config.logger.log(
-          "error",
-          "generate",
-          "No output from generation",
-          {}
-        );
+
+        const output = convo.output;
+        if (output) {
+          try {
+            const parsed = JSON.parse(output);
+            if (!validatePipelineSchema(parsed)) {
+              const errs = getPipelineValidationErrors();
+              throw new Error(`Validation errors: ${errs?.join(", ")}`);
+            }
+            const compiled = this.config.pipelineProvider.compile(parsed);
+            if (!hasPipeline(compiled)) {
+              throw new Error(
+                `Compile errors: ${compiled.errors
+                  .map((item) => JSON.stringify(item))
+                  .join(", ")}`
+              );
+            }
+            return { result: compiled.pipeline!, messages: convo.history };
+          } catch (e: any) {
+            convo.clearOutput();
+            convo.add({
+              type: "message",
+              role: "system",
+              content: JSON.stringify({
+                type: "pipeline-error",
+                message: e.message,
+              }),
+            });
+          }
+        } else {
+          this.config.logger.log(
+            "error",
+            "generate",
+            "No output from generation",
+            {}
+          );
+        }
+
+        retryCount++;
       }
 
-      retryCount++;
+      return { messages: convo.history };
+    } finally {
+      this.emitEnd({
+        source: "pipeline.generate",
+        model: promptConfig.model,
+        startedAt: start.startedAt,
+        metadata: {
+          promptLength: userPrompt.length,
+        },
+        usage: convo?.usage,
+      });
     }
-
-    return { messages: convo.history };
   }
 }

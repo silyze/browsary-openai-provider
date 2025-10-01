@@ -2,6 +2,7 @@ import OpenAI from "openai";
 import { DEFAULT_TEMPERATURE } from "./defaults";
 import { assert } from "@mojsoski/assert";
 import { createErrorObject, type Logger } from "@silyze/logger";
+import { TokenUsage } from "@silyze/browsary-ai-provider";
 
 export interface FunctionConfiguration {
   tools: OpenAI.Responses.Tool[];
@@ -30,6 +31,21 @@ export class Conversation {
   #config: ConversationConfiguration;
   #history: OpenAI.Responses.ResponseInput;
   #output: string | undefined;
+  #usage: TokenUsage | undefined;
+
+  #mapUsage(
+    usage?: OpenAI.Responses.ResponseUsage | null
+  ): TokenUsage | undefined {
+    if (!usage) {
+      return undefined;
+    }
+
+    return {
+      inputTokens: usage.input_tokens,
+      outputTokens: usage.output_tokens,
+      totalTokens: usage.total_tokens,
+    };
+  }
 
   #pushMessage(
     message:
@@ -50,6 +66,10 @@ export class Conversation {
 
   get output() {
     return this.#output;
+  }
+
+  get usage() {
+    return this.#usage;
   }
 
   constructor(config: ConversationConfiguration) {
@@ -118,6 +138,8 @@ export class Conversation {
         tools: this.#config.functions.tools,
         text: this.#config.model.text,
       });
+
+      this.#usage = this.#mapUsage(response.usage);
 
       this.#config.logger.log(
         "debug",
