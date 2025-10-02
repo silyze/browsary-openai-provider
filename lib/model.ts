@@ -12,13 +12,13 @@ import OpenAI from "openai";
 import { DEFAULT_TEMPERATURE } from "./defaults";
 
 type UsageEmitter = {
-  emitStart(
+  emitStartChecked(
     base: Omit<UsageEventStart, "phase" | "startedAt">
-  ): UsageEventStart;
-  emitEnd(
+  ): Promise<{ event: UsageEventStart; proceed: boolean }>;
+  emitEndChecked(
     base: Omit<UsageEventEnd, "phase" | "endedAt">,
     started?: number
-  ): UsageEventEnd;
+  ): Promise<{ event: UsageEventEnd; proceed: boolean }>;
 };
 
 export class OpenAiModel<TModelContext> extends AiModel<TModelContext> {
@@ -60,10 +60,7 @@ export class OpenAiModel<TModelContext> extends AiModel<TModelContext> {
   #mapUsage(
     usage?: OpenAI.Responses.ResponseUsage | null
   ): TokenUsage | undefined {
-    if (!usage) {
-      return undefined;
-    }
-
+    if (!usage) return undefined;
     return {
       inputTokens: usage.input_tokens,
       outputTokens: usage.output_tokens,
@@ -81,13 +78,18 @@ export class OpenAiModel<TModelContext> extends AiModel<TModelContext> {
       context,
     });
 
-    const start = this.#usageEmitter.emitStart({
+    const start = await this.#usageEmitter.emitStartChecked({
       source: "model.prompt",
       model: this.#model,
-      metadata: {
-        messageCount: input.length,
-      },
+      metadata: { messageCount: input.length },
     });
+
+    if (!start.proceed) {
+      this.#logger.log("debug", "prompt", "Monitor vetoed start", {
+        model: this.#model,
+      });
+      return { messages: input, result: undefined };
+    }
 
     try {
       const response = await (
@@ -101,33 +103,37 @@ export class OpenAiModel<TModelContext> extends AiModel<TModelContext> {
       const outputText = response.output_text ?? "";
       this.#logger.log("debug", "prompt", "Prompt completed", response.output);
 
-      for (const item of response.output) {
-        input.push(item);
+      for (const item of response.output) input.push(item);
+
+      const end = await this.#usageEmitter.emitEndChecked(
+        {
+          source: "model.prompt",
+          model: this.#model,
+          startedAt: start.event.startedAt,
+          usage: this.#mapUsage(response.usage),
+          metadata: { messageCount: input.length },
+        },
+        start.event.startedAt
+      );
+
+      if (!end.proceed) {
+        this.#logger.log("debug", "prompt", "Monitor vetoed end", {
+          model: this.#model,
+        });
+        return { messages: input, result: undefined };
       }
 
-      this.#usageEmitter.emitEnd({
-        source: "model.prompt",
-        model: this.#model,
-        startedAt: start.startedAt,
-        usage: this.#mapUsage(response.usage),
-        metadata: {
-          messageCount: input.length,
-        },
-      });
-
-      return {
-        messages: input,
-        result: outputText,
-      };
+      return { messages: input, result: outputText };
     } catch (error) {
-      this.#usageEmitter.emitEnd({
-        source: "model.prompt",
-        model: this.#model,
-        startedAt: start.startedAt,
-        metadata: {
-          messageCount: input.length,
+      await this.#usageEmitter.emitEndChecked(
+        {
+          source: "model.prompt",
+          model: this.#model,
+          startedAt: start.event.startedAt,
+          metadata: { messageCount: input.length },
         },
-      });
+        start.event.startedAt
+      );
       throw error;
     }
   }
@@ -143,13 +149,18 @@ export class OpenAiModel<TModelContext> extends AiModel<TModelContext> {
       context,
     });
 
-    const start = this.#usageEmitter.emitStart({
+    const start = await this.#usageEmitter.emitStartChecked({
       source: "model.promptWithSchema",
       model: this.#model,
-      metadata: {
-        messageCount: input.length,
-      },
+      metadata: { messageCount: input.length },
     });
+
+    if (!start.proceed) {
+      this.#logger.log("debug", "promptWithSchema", "Monitor vetoed start", {
+        model: this.#model,
+      });
+      return { messages: input, result: undefined as unknown as T };
+    }
 
     try {
       const response = await (
@@ -176,33 +187,37 @@ export class OpenAiModel<TModelContext> extends AiModel<TModelContext> {
         response.output
       );
 
-      for (const item of response.output) {
-        input.push(item);
+      for (const item of response.output) input.push(item);
+
+      const end = await this.#usageEmitter.emitEndChecked(
+        {
+          source: "model.promptWithSchema",
+          model: this.#model,
+          startedAt: start.event.startedAt,
+          usage: this.#mapUsage(response.usage),
+          metadata: { messageCount: input.length },
+        },
+        start.event.startedAt
+      );
+
+      if (!end.proceed) {
+        this.#logger.log("debug", "promptWithSchema", "Monitor vetoed end", {
+          model: this.#model,
+        });
+        return { messages: input, result: undefined as unknown as T };
       }
 
-      this.#usageEmitter.emitEnd({
-        source: "model.promptWithSchema",
-        model: this.#model,
-        startedAt: start.startedAt,
-        usage: this.#mapUsage(response.usage),
-        metadata: {
-          messageCount: input.length,
-        },
-      });
-
-      return {
-        messages: input,
-        result: JSON.parse(outputText),
-      };
+      return { messages: input, result: JSON.parse(outputText) as T };
     } catch (error) {
-      this.#usageEmitter.emitEnd({
-        source: "model.promptWithSchema",
-        model: this.#model,
-        startedAt: start.startedAt,
-        metadata: {
-          messageCount: input.length,
+      await this.#usageEmitter.emitEndChecked(
+        {
+          source: "model.promptWithSchema",
+          model: this.#model,
+          startedAt: start.event.startedAt,
+          metadata: { messageCount: input.length },
         },
-      });
+        start.event.startedAt
+      );
       throw error;
     }
   }

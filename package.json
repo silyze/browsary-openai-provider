@@ -1,6 +1,6 @@
 {
   "name": "@silyze/browsary-openai-provider",
-  "version": "1.1.19",
+  "version": "1.1.20",
   "description": "OpenAI provider for @silyze/browsary-ai-provider",
   "main": "dist/lib/index.js",
   "types": "dist/lib/index.d.ts",
@@ -27,7 +27,7 @@
   },
   "dependencies": {
     "@mojsoski/assert": "^1.0.0",
-    "@silyze/browsary-ai-provider": "^1.2.0",
+    "@silyze/browsary-ai-provider": "^1.2.1",
     "@silyze/browsary-pipeline": "^1.0.0",
     "@silyze/logger": "^1.0.1",
     "openai": "^5.2.0",

@@ -55,8 +55,8 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
       this.config,
       context,
       {
-        emitStart: (base) => this.emitStart(base),
-        emitEnd: (base, started) => this.emitEnd(base, started),
+        emitStartChecked: (base) => this.emitStartChecked(base),
+        emitEndChecked: (base, started) => this.emitEndChecked(base, started),
       }
     );
   }
@@ -127,13 +127,20 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
       },
     };
 
-    const start = this.emitStart({
+    const start = await this.emitStartChecked({
       source: "pipeline.analyze",
       model: promptConfig.model,
       metadata: {
         promptLength: userPrompt.length,
       },
     });
+
+    if (!start.proceed) {
+      this.config.logger.log("debug", "analyze", "Monitor vetoed start", {
+        model: promptConfig.model,
+      });
+      return { messages: [] };
+    }
 
     const functionCallRef = this.callFunctionWithTelemetry.bind(this);
     const functionsConfig: FunctionConfiguration = {
@@ -163,10 +170,30 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
 
       const output = convo.output;
       const messages = convo.history;
+
       if (!output) {
         this.config.logger.log("error", "analyze", "Analysis failed", {
           prompt: userPrompt,
         });
+
+        const end = await this.emitEndChecked(
+          {
+            source: "pipeline.analyze",
+            model: promptConfig.model,
+            startedAt: start.event.startedAt,
+            metadata: { promptLength: userPrompt.length },
+            usage: convo.usage,
+          },
+          start.event.startedAt
+        );
+
+        if (!end.proceed) {
+          this.config.logger.log("debug", "analyze", "Monitor vetoed end", {
+            model: promptConfig.model,
+          });
+          return { messages };
+        }
+
         return { messages };
       }
 
@@ -176,17 +203,37 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
         prompt: userPrompt,
       });
 
-      return { result: { analysis, prompt: userPrompt }, messages };
-    } finally {
-      this.emitEnd({
-        source: "pipeline.analyze",
-        model: promptConfig.model,
-        startedAt: start.startedAt,
-        metadata: {
-          promptLength: userPrompt.length,
+      const end = await this.emitEndChecked(
+        {
+          source: "pipeline.analyze",
+          model: promptConfig.model,
+          startedAt: start.event.startedAt,
+          metadata: { promptLength: userPrompt.length },
+          usage: convo.usage,
         },
-        usage: convo.usage,
-      });
+        start.event.startedAt
+      );
+
+      if (!end.proceed) {
+        this.config.logger.log("debug", "analyze", "Monitor vetoed end", {
+          model: promptConfig.model,
+        });
+        return { messages };
+      }
+
+      return { result: { analysis, prompt: userPrompt }, messages };
+    } catch (error) {
+      await this.emitEndChecked(
+        {
+          source: "pipeline.analyze",
+          model: promptConfig.model,
+          startedAt: start.event.startedAt,
+          metadata: { promptLength: userPrompt.length },
+          usage: convo.usage,
+        },
+        start.event.startedAt
+      );
+      throw error;
     }
   }
 
@@ -217,7 +264,7 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
       text: pipelineOutput,
     };
 
-    const start = this.emitStart({
+    const start = await this.emitStartChecked({
       source: "pipeline.generate",
       model: promptConfig.model,
       metadata: {
@@ -225,7 +272,14 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
       },
     });
 
-    let convo: Conversation | undefined = undefined;
+    if (!start.proceed) {
+      this.config.logger.log("debug", "generate", "Monitor vetoed start", {
+        model: promptConfig.model,
+      });
+      return { messages: [] };
+    }
+
+    let convo: Conversation | undefined;
 
     const functionsConfig: FunctionConfiguration = {
       tools: [
@@ -304,6 +358,28 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
                   .join(", ")}`
               );
             }
+
+            const end = await this.emitEndChecked(
+              {
+                source: "pipeline.generate",
+                model: promptConfig.model,
+                startedAt: start.event.startedAt,
+                metadata: { promptLength: userPrompt.length },
+                usage: convo.usage,
+              },
+              start.event.startedAt
+            );
+
+            if (!end.proceed) {
+              this.config.logger.log(
+                "debug",
+                "generate",
+                "Monitor vetoed end",
+                { model: promptConfig.model }
+              );
+              return { messages: convo.history };
+            }
+
             return { result: compiled.pipeline!, messages: convo.history };
           } catch (e: any) {
             convo.clearOutput();
@@ -328,17 +404,36 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
         retryCount++;
       }
 
-      return { messages: convo.history };
-    } finally {
-      this.emitEnd({
-        source: "pipeline.generate",
-        model: promptConfig.model,
-        startedAt: start.startedAt,
-        metadata: {
-          promptLength: userPrompt.length,
+      const end = await this.emitEndChecked(
+        {
+          source: "pipeline.generate",
+          model: promptConfig.model,
+          startedAt: start.event.startedAt,
+          metadata: { promptLength: userPrompt.length },
+          usage: convo?.usage,
         },
-        usage: convo?.usage,
-      });
+        start.event.startedAt
+      );
+
+      if (!end.proceed) {
+        this.config.logger.log("debug", "generate", "Monitor vetoed end", {
+          model: promptConfig.model,
+        });
+      }
+
+      return { messages: convo?.history ?? [] };
+    } catch (error) {
+      await this.emitEndChecked(
+        {
+          source: "pipeline.generate",
+          model: promptConfig.model,
+          startedAt: start.event.startedAt,
+          metadata: { promptLength: userPrompt.length },
+          usage: convo?.usage,
+        },
+        start.event.startedAt
+      );
+      throw error;
     }
   }
 }
