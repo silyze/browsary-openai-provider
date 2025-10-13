@@ -348,7 +348,11 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
             const parsed = JSON.parse(output);
             if (!validatePipelineSchema(parsed)) {
               const errs = getPipelineValidationErrors();
-              throw new Error(`Validation errors: ${errs?.join(", ")}`);
+              throw new Error(
+                `Validation errors: ${errs
+                  ?.map((item) => JSON.stringify(item))
+                  .join(", ")}`
+              );
             }
             const compiled = this.config.pipelineProvider.compile(parsed);
             if (!hasPipeline(compiled)) {
