@@ -5,6 +5,7 @@ import {
   stringInputType,
   waitEventType,
 } from "@silyze/browsary-pipeline";
+import { FunctionPromptSections } from "./functions";
 
 export const analyzeTools: OpenAI.Responses.FunctionTool[] = [
   {
@@ -159,7 +160,22 @@ export const analyzeOutputSchema = {
   additionalProperties: false,
 };
 
-const analyzePrompt = `
+export type AnalyzePromptOptions = {
+  functions?: FunctionPromptSections;
+};
+
+const analyzePrompt = (options: AnalyzePromptOptions = {}) => {
+  const sections = options.functions
+    ? [options.functions.index, options.functions.example].filter(
+        (value): value is string => !!value
+      )
+    : [];
+
+  const functionsSection = sections.length
+    ? `\n${sections.join("\n\n")}\n`
+    : "";
+
+  return `
 You are a browser automation analysis tool.
 
 Your goal is for a given prompt to:
@@ -177,5 +193,7 @@ Rules:
 
 When all the steps and selectors are known to generate the pipeline, return the output as soon as possible.
 
-`;
+${functionsSection}`;
+};
+
 export default analyzePrompt;

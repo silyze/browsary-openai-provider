@@ -4,6 +4,7 @@ import {
   RefType,
 } from "@silyze/browsary-pipeline";
 import { AnalyzeOutput } from "@silyze/browsary-ai-provider";
+import { FunctionPromptSections } from "./functions";
 
 import type OpenAI from "openai";
 import Ajv from "ajv";
@@ -63,7 +64,8 @@ export function formatPipelineNodes(schema: typeof pipelineSchema): string {
       ]
         .filter(Boolean)
         .join(". ");
-      return `- \`${name}\` → ${description}${io ? `. ${io}` : ""}`;
+      const detail = [description, io].filter(Boolean).join(". ");
+      return detail ? `- \`${name}\` - ${detail}` : `- \`${name}\``;
     })
     .join("\n");
 }
@@ -95,7 +97,21 @@ const pipelineNodeList = `## Available pipeline nodes:\n${formatPipelineNodes(
   pipelineSchema
 )}`;
 
-const pipelinePrompt = (analysis: AnalyzeOutput) => `
+const pipelinePrompt = (
+  analysis: AnalyzeOutput,
+  functions?: FunctionPromptSections
+) => {
+  const sections = functions
+    ? [functions.index, functions.example].filter(
+        (value): value is string => !!value
+      )
+    : [];
+
+  const functionsText = sections.length
+    ? `\n${sections.join("\n\n")}\n`
+    : "";
+
+  return `
 You are a browser automation agent. Your task is to convert natural language instructions into a JSON pipeline that automates interactions with a web browser.
 
 # Analyze phase output:
@@ -166,9 +182,10 @@ This enables mutable state for counters, accumulators, etc.
 Before emitting any node, you must:
 - Call \`getNodeSchema(nodeType)\`
 - Use its structure to ensure your \`inputs\`, \`outputs\`, and shape match what the node expects
-- Do not guess — validation against this schema is mandatory
+- Do not guess - validation against this schema is mandatory
 
 ${pipelineNodeList}
+${functionsText}
 
 ---
 
@@ -253,5 +270,6 @@ ${pipelineNodeList}
 
 This demonstrates conditional looping using output redirection and evaluation-based gating.
 `;
+};
 
 export default pipelinePrompt;

@@ -17,6 +17,10 @@ import {
   getPipelineValidationErrors,
 } from "./prompts/pipeline";
 import pipelinePrompt from "./prompts/pipeline";
+import {
+  buildFunctionPromptSections,
+  FunctionPromptSections,
+} from "./prompts/functions";
 import { Page } from "puppeteer-core";
 import { type Logger } from "@silyze/logger";
 import {
@@ -24,6 +28,7 @@ import {
   hasPipeline,
   Pipeline,
   PipelineProvider,
+  PipelineFunctionProvider,
   pipelineSchema,
 } from "@silyze/browsary-pipeline";
 import { OpenAiModel } from "./model";
@@ -37,6 +42,7 @@ import {
 export type OpenAiConfig = {
   openAi: OpenAI;
   pipelineProvider: PipelineProvider;
+  functionProvider?: PipelineFunctionProvider;
   logger: Logger;
   models?: {
     analyze?: string;
@@ -45,6 +51,53 @@ export type OpenAiConfig = {
 };
 
 export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
+  private functionPromptSectionsPromise?: Promise<
+    FunctionPromptSections | undefined
+  >;
+
+  private resolveFunctionProvider(): PipelineFunctionProvider | undefined {
+    if (this.config.functionProvider) {
+      return this.config.functionProvider;
+    }
+
+    const candidate = (
+      this.config.pipelineProvider as Partial<{
+        functionProvider?: PipelineFunctionProvider;
+      }>
+    ).functionProvider;
+
+    return candidate;
+  }
+
+  private getFunctionPromptSections(): Promise<
+    FunctionPromptSections | undefined
+  > {
+    if (!this.functionPromptSectionsPromise) {
+      this.functionPromptSectionsPromise = (async () => {
+        const provider = this.resolveFunctionProvider();
+        if (!provider) {
+          return undefined;
+        }
+
+        try {
+          return await buildFunctionPromptSections(provider);
+        } catch (error) {
+          const message =
+            error instanceof Error ? error.message : String(error);
+          this.config.logger.log(
+            "warn",
+            "prompt",
+            "Failed to build function index",
+            { message }
+          );
+          return undefined;
+        }
+      })();
+    }
+
+    return this.functionPromptSectionsPromise;
+  }
+
   createModel<TModelContext>(
     model: string,
     context: TModelContext
@@ -102,10 +155,15 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
       prompt: userPrompt,
     });
 
+    const functionPromptSections = await this.getFunctionPromptSections();
+
     const promptConfig: ModelConfiguration = {
       model: this.config.models?.analyze ?? ANALYZE_MODEL,
       prompt: [
-        { role: "system", content: analyzePrompt },
+        {
+          role: "system",
+          content: analyzePrompt({ functions: functionPromptSections }),
+        },
         {
           role: "system",
           content: `Previous pipeline version:\n ${JSON.stringify(
@@ -245,7 +303,9 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
   ): Promise<AiResult<Pipeline>> {
     let retryCount = 0;
 
-    const initialPrompt = pipelinePrompt(analysis);
+    const functionPromptSections = await this.getFunctionPromptSections();
+
+    const initialPrompt = pipelinePrompt(analysis, functionPromptSections);
     const promptConfig: ModelConfiguration = {
       model: this.config.models?.generate ?? PIPELINE_GENERATE_MODEL,
       prompt: [
