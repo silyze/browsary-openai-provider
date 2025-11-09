@@ -8,7 +8,8 @@ export interface FunctionConfiguration {
   tools: OpenAI.Responses.Tool[];
   handle(
     call: OpenAI.Responses.ResponseFunctionToolCall,
-    history: OpenAI.Responses.ResponseInput
+    history: OpenAI.Responses.ResponseInput,
+    abortController?: AbortController
   ): Promise<unknown>;
 }
 
@@ -25,6 +26,7 @@ export interface ConversationConfiguration {
   openAi: OpenAI;
   logger: Logger;
   onMessages?: (messages: unknown[]) => void | Promise<void>;
+  abortController?: AbortController;
 }
 
 export class Conversation {
@@ -72,6 +74,22 @@ export class Conversation {
     return this.#usage;
   }
 
+  #throwIfAborted() {
+    const signal = this.#config.abortController?.signal;
+    if (!signal?.aborted) {
+      return;
+    }
+
+    const reason = signal.reason;
+    if (reason instanceof Error) {
+      throw reason;
+    }
+
+    throw new Error(
+      typeof reason === "string" ? reason : "Conversation aborted"
+    );
+  }
+
   constructor(config: ConversationConfiguration) {
     this.#config = config;
     this.#history = config.model.prompt;
@@ -114,11 +132,13 @@ export class Conversation {
       this.#output === undefined,
       "Cannot start a conversation that is already complete"
     );
+    this.#throwIfAborted();
 
     let running = true;
     const { model, temperature } = this.#config.model;
 
     while (running) {
+      this.#throwIfAborted();
       this.#config.logger.log(
         "debug",
         "conversation",
@@ -131,13 +151,17 @@ export class Conversation {
       );
 
       yield;
-      const response = await this.#config.openAi.responses.create({
-        model,
-        input: this.#history,
-        temperature: temperature ?? DEFAULT_TEMPERATURE,
-        tools: this.#config.functions.tools,
-        text: this.#config.model.text,
-      });
+      this.#throwIfAborted();
+      const response = await this.#config.openAi.responses.create(
+        {
+          model,
+          input: this.#history,
+          temperature: temperature ?? DEFAULT_TEMPERATURE,
+          tools: this.#config.functions.tools,
+          text: this.#config.model.text,
+        },
+        { signal: this.#config.abortController?.signal ?? undefined }
+      );
 
       this.#usage = this.#mapUsage(response.usage);
 
@@ -165,7 +189,8 @@ export class Conversation {
           try {
             const result = await this.#config.functions.handle(
               message,
-              this.#history
+              this.#history,
+              this.#config.abortController
             );
             this.#config.logger.log(
               "debug",

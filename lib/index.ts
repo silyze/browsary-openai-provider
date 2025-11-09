@@ -29,7 +29,10 @@ import {
   Pipeline,
   PipelineProvider,
   PipelineFunctionProvider,
+  PipelineFunction,
   pipelineSchema,
+  RefType,
+  typeDescriptor,
 } from "@silyze/browsary-pipeline";
 import { OpenAiModel } from "./model";
 
@@ -38,6 +41,260 @@ import {
   ModelConfiguration,
   FunctionConfiguration,
 } from "./conversation";
+
+type OutputSchema = {
+  anyOf: Array<Record<string, unknown>>;
+};
+
+const dependsOnSchema: Record<string, unknown> = {
+  description:
+    "Defines execution dependencies. Can be a string (node ID), an object reference to a boolean output, or an array of either.",
+  anyOf: [
+    {
+      type: "string",
+      description: "Node ID this node depends on unconditionally.",
+    },
+    {
+      type: "object",
+      description:
+        "Conditional dependency. This node will only run if the referenced output is truthy.",
+      properties: {
+        nodeName: {
+          type: "string",
+          description: "Name of the node that produces the output.",
+        },
+        outputName: {
+          type: "string",
+          description: "Name of the boolean output to evaluate.",
+        },
+      },
+      required: ["nodeName", "outputName"],
+      additionalProperties: false,
+    },
+    {
+      type: "array",
+      description:
+        "List of dependencies, each being either a node ID or a conditional output reference.",
+      items: {
+        anyOf: [
+          {
+            type: "string",
+            description: "Node ID this node depends on.",
+          },
+          {
+            type: "object",
+            description:
+              "Conditional dependency based on output of another node.",
+            properties: {
+              nodeName: {
+                type: "string",
+                description: "Name of the node producing the output.",
+              },
+              outputName: {
+                type: "string",
+                description: "Name of the boolean output to evaluate.",
+              },
+            },
+            required: ["nodeName", "outputName"],
+            additionalProperties: false,
+          },
+        ],
+      },
+    },
+  ],
+};
+
+function descriptorToSchema(refType: string): Record<string, unknown> {
+  const descriptor =
+    typeDescriptor[refType as keyof typeof typeDescriptor] ?? null;
+
+  if (Array.isArray(descriptor)) {
+    return { enum: [...descriptor] };
+  }
+
+  if (descriptor && typeof descriptor === "object") {
+    return { ...descriptor };
+  }
+
+  if (typeof descriptor === "string") {
+    return { type: descriptor };
+  }
+
+  return {};
+}
+
+function createOutputReferenceSchema(
+  refType: string,
+  description?: string
+): OutputSchema {
+  const summary = description
+    ? `${description} (type '${refType}')`
+    : `Output reference of type '${refType}'.`;
+
+  return {
+    anyOf: [
+      {
+        type: "string",
+        description: summary,
+        [RefType]: refType,
+      },
+      {
+        type: "object",
+        description:
+          "Dynamic output reference to input of another node (type '" +
+          refType +
+          "').",
+        properties: {
+          nodeName: { type: "string" },
+          inputName: { type: "string" },
+        },
+        required: ["nodeName", "inputName"],
+        additionalProperties: false,
+        [RefType]: refType,
+      },
+    ],
+  };
+}
+
+function createOutputOfInputSchema(refType: string): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      type: {
+        const: "outputOf",
+        type: "string",
+        [RefType]: refType,
+      },
+      nodeName: { type: "string" },
+      outputName: { type: "string" },
+    },
+    required: ["type", "nodeName", "outputName"],
+    additionalProperties: false,
+  };
+}
+
+function createConstantInputSchema(
+  valueSchema: Record<string, unknown>
+): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      type: { const: "constant", type: "string" },
+      value: valueSchema,
+    },
+    required: ["type", "value"],
+    additionalProperties: false,
+  };
+}
+
+function buildArgsValueSchema(
+  inputs: PipelineFunction["inputs"]
+): Record<string, unknown> {
+  const properties = Object.fromEntries(
+    inputs.map((input) => {
+      const schema = descriptorToSchema(input.refType);
+      if (input.description) {
+        return [
+          input.name,
+          {
+            ...schema,
+            description: input.description,
+          },
+        ] as const;
+      }
+      return [input.name, schema] as const;
+    })
+  );
+
+  return {
+    type: "object",
+    description: "Function argument values keyed by input name.",
+    properties,
+    required: inputs.map((input) => input.name),
+    additionalProperties: false,
+  };
+}
+
+function buildFunctionCallSchema(
+  identifier: string,
+  fn: PipelineFunction
+): Record<string, unknown> {
+  const argsValueSchema = buildArgsValueSchema(fn.inputs);
+  const identifierInputSchema = {
+    anyOf: [
+      createOutputOfInputSchema("string"),
+      createConstantInputSchema({ type: "string", const: identifier }),
+    ],
+  };
+
+  const argsInputSchema = {
+    anyOf: [
+      createOutputOfInputSchema("object"),
+      createConstantInputSchema(argsValueSchema),
+    ],
+  };
+
+  const outputEntries = new Map<string, OutputSchema>();
+
+  for (const output of fn.outputs) {
+    outputEntries.set(
+      output.name,
+      createOutputReferenceSchema(output.refType, output.description)
+    );
+  }
+
+  const resultDescription =
+    fn.outputType === "iterator"
+      ? "Aggregated iterator results (type 'any')."
+      : "Return value of the function (type 'any').";
+
+  outputEntries.set(
+    "result",
+    createOutputReferenceSchema("any", resultDescription)
+  );
+
+  const outputs = Object.fromEntries(outputEntries);
+
+  return {
+    title: fn.metadata?.title
+      ? `Call function: ${fn.metadata.title}`
+      : `Call function: ${identifier}`,
+    description:
+      fn.metadata?.description ??
+      `Invoke reusable pipeline function '${identifier}'.`,
+    type: "object",
+    properties: {
+      node: {
+        type: "string",
+        const: "functions::call",
+        description:
+          "Unique identifier in the format 'prefix::action'. Always 'functions::call' for function invocations.",
+      },
+      dependsOn: dependsOnSchema,
+      inputs: {
+        type: "object",
+        description:
+          "Input bindings for this node. Keys map to inputs declared in the node type.",
+        properties: {
+          identifier: identifierInputSchema,
+          args: argsInputSchema,
+        },
+        required: ["identifier", "args"],
+        additionalProperties: false,
+      },
+      outputs: {
+        type: "object",
+        description:
+          "Outputs produced by this node. Provide bindings for each declared output.",
+        properties: outputs,
+        required: Array.from(outputEntries.keys()),
+        additionalProperties: false,
+      },
+    },
+    required: ["node", "inputs", "outputs", "dependsOn"],
+    additionalProperties: false,
+  };
+}
 
 export type OpenAiConfig = {
   openAi: OpenAI;
@@ -54,6 +311,21 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
   private functionPromptSectionsPromise?: Promise<
     FunctionPromptSections | undefined
   >;
+
+  private throwIfAborted(abortController?: AbortController) {
+    if (!abortController?.signal.aborted) {
+      return;
+    }
+
+    const reason = abortController.signal.reason;
+    if (reason instanceof Error) {
+      throw reason;
+    }
+
+    throw new Error(
+      typeof reason === "string" ? reason : "Operation aborted"
+    );
+  }
 
   private resolveFunctionProvider(): PipelineFunctionProvider | undefined {
     if (this.config.functionProvider) {
@@ -98,6 +370,45 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
     return this.functionPromptSectionsPromise;
   }
 
+  private async getFunctionNodeSchema(
+    identifier: string
+  ): Promise<Record<string, unknown> | undefined> {
+    const provider = this.resolveFunctionProvider();
+    if (!provider) {
+      return undefined;
+    }
+
+    const separatorIndex = identifier.indexOf("::");
+    if (separatorIndex === -1) {
+      return undefined;
+    }
+
+    const namespace = identifier.slice(0, separatorIndex);
+    const name = identifier.slice(separatorIndex + 2);
+
+    if (!namespace || !name) {
+      return undefined;
+    }
+
+    try {
+      const fn = await provider.getFunction(namespace, name);
+      if (!fn) {
+        return undefined;
+      }
+
+      return buildFunctionCallSchema(identifier, fn);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.config.logger.log(
+        "warn",
+        "generate",
+        "Failed to resolve function schema",
+        { identifier, message }
+      );
+      return undefined;
+    }
+  }
+
   createModel<TModelContext>(
     model: string,
     context: TModelContext
@@ -116,7 +427,12 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
 
   constructor(
     config: OpenAiConfig,
-    functionCall: (ctx: Page, name: string, params: any) => Promise<unknown>,
+    functionCall: (
+      ctx: Page,
+      name: string,
+      params: any,
+      abortController?: AbortController
+    ) => Promise<unknown>,
     monitor?: UsageMonitor
   ) {
     super(
@@ -149,13 +465,16 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
     page: Page,
     userPrompt: string,
     previousPipeline: Record<string, GenericNode>,
-    onMessages?: (msgs: unknown[]) => void | Promise<void>
+    onMessages?: (msgs: unknown[]) => void | Promise<void>,
+    abortController?: AbortController
   ): Promise<AiResult<AnalysisResult>> {
     this.config.logger.log("info", "analyze", "Analysis started", {
       prompt: userPrompt,
     });
+    this.throwIfAborted(abortController);
 
     const functionPromptSections = await this.getFunctionPromptSections();
+    this.throwIfAborted(abortController);
 
     const promptConfig: ModelConfiguration = {
       model: this.config.models?.analyze ?? ANALYZE_MODEL,
@@ -203,9 +522,14 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
     const functionCallRef = this.callFunctionWithTelemetry.bind(this);
     const functionsConfig: FunctionConfiguration = {
       tools: analyzeTools,
-      async handle(call) {
+      async handle(call, _history, handlerAbortController) {
         const params = JSON.parse(call.arguments);
-        const result = await functionCallRef(page, call.name, params);
+        const result = await functionCallRef(
+          page,
+          call.name,
+          params,
+          handlerAbortController ?? abortController
+        );
         return result ?? {};
       },
     };
@@ -216,6 +540,7 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
       openAi: this.config.openAi,
       onMessages,
       logger: this.config.logger.createScope(promptConfig.model),
+      abortController,
     });
 
     try {
@@ -299,11 +624,14 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
     page: Page,
     { analysis, prompt: userPrompt }: AnalysisResult,
     previousPipeline: Record<string, GenericNode>,
-    onMessages?: (msgs: unknown[]) => void | Promise<void>
+    onMessages?: (msgs: unknown[]) => void | Promise<void>,
+    abortController?: AbortController
   ): Promise<AiResult<Pipeline>> {
     let retryCount = 0;
+    this.throwIfAborted(abortController);
 
     const functionPromptSections = await this.getFunctionPromptSections();
+    this.throwIfAborted(abortController);
 
     const initialPrompt = pipelinePrompt(analysis, functionPromptSections);
     const promptConfig: ModelConfiguration = {
@@ -341,6 +669,7 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
 
     let convo: Conversation | undefined;
 
+    const self = this;
     const functionsConfig: FunctionConfiguration = {
       tools: [
         {
@@ -359,12 +688,14 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
           strict: true,
         },
       ],
-      async handle(call, history) {
+      async handle(call, history, _handlerAbortController) {
         const params = JSON.parse(call.arguments);
         const nodeName = params.node as string;
-        const nodeSchema = pipelineSchema.additionalProperties.anyOf.find(
+        const builtinSchema = pipelineSchema.additionalProperties.anyOf.find(
           (s) => s.properties.node.const === nodeName
-        );
+        ) as unknown as Record<string, unknown> | undefined;
+        const nodeSchema =
+          builtinSchema ?? (await self.getFunctionNodeSchema(nodeName));
         if (!nodeSchema)
           throw new TypeError(`Node schema for "${nodeName}" was not found`);
 
@@ -395,10 +726,12 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
       openAi: this.config.openAi,
       onMessages,
       logger: this.config.logger.createScope(promptConfig.model),
+      abortController,
     });
 
     try {
       while (retryCount < MAX_RESPONSE_FIX_RETRY) {
+        this.throwIfAborted(abortController);
         for await (const _ of convo.start()) {
         }
 
