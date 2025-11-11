@@ -3,7 +3,7 @@ import {
   genericNodeSchema,
   RefType,
 } from "@silyze/browsary-pipeline";
-import { AnalyzeOutput } from "@silyze/browsary-ai-provider";
+import { AnalyzeOutput } from "../provider-alpha";
 import { FunctionPromptSections } from "./functions";
 
 import type OpenAI from "openai";

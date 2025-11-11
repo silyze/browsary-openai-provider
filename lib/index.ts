@@ -1,22 +1,23 @@
 import OpenAI from "openai";
-import { MAX_RESPONSE_FIX_RETRY } from "./defaults";
+import { randomUUID } from "crypto";
 import { assert } from "@mojsoski/assert";
 import {
   AiModel,
   AiProvider,
-  AiResult,
-  AnalysisResult,
+  AiAgentConversationState,
+  PromptParams,
+  ContinuePromptParams,
+  AiAgentControlRequest,
   UsageMonitor,
-} from "@silyze/browsary-ai-provider";
-import analyzePrompt, { analyzeOutputSchema } from "./prompts/analyze";
-import { ANALYZE_MODEL, analyzeTools } from "./prompts/analyze";
+  PipelineConversationCallbacks,
+} from "./provider-alpha";
+import { analyzeTools } from "./prompts/analyze";
 import {
-  pipelineOutput,
   validatePipelineSchema,
   PIPELINE_GENERATE_MODEL,
   getPipelineValidationErrors,
 } from "./prompts/pipeline";
-import pipelinePrompt from "./prompts/pipeline";
+import agentPrompt from "./prompts/agent";
 import {
   buildFunctionPromptSections,
   FunctionPromptSections,
@@ -31,6 +32,7 @@ import {
   PipelineFunctionProvider,
   PipelineFunction,
   pipelineSchema,
+  genericNodeSchema,
   RefType,
   typeDescriptor,
 } from "@silyze/browsary-pipeline";
@@ -296,6 +298,88 @@ function buildFunctionCallSchema(
   };
 }
 
+type ConversationPhase =
+  | "idle"
+  | "acting"
+  | "awaiting-user"
+  | "complete"
+  | "paused"
+  | "error";
+
+type AgentOutputData = {
+  description?: string;
+  data?: unknown;
+  final?: boolean;
+};
+
+type AgentChatMessage = {
+  message: string;
+  audience: "user" | "observers";
+  at: number;
+};
+
+type AgentRunVerification = {
+  success: boolean;
+  errors?: unknown[];
+  note?: string;
+  timestamp: number;
+};
+
+type AgentArtifactState = {
+  messages?: unknown[];
+  lastMessage?: string;
+  lastTool?: string;
+  pendingQuestion?: string;
+  outputData?: AgentOutputData;
+  chatLog?: AgentChatMessage[];
+  lastVerification?: AgentRunVerification;
+};
+
+type EmittedPipelineResult = {
+  raw: Record<string, GenericNode>;
+  pipeline: Pipeline;
+};
+
+type AgentRunResult = {
+  messages: unknown[];
+  outputText?: string;
+  emittedPipeline?: EmittedPipelineResult;
+  pendingQuestion?: string;
+  outputData?: AgentOutputData;
+  chatMessages: AgentChatMessage[];
+  verification?: AgentRunVerification;
+  finishRequested?: boolean;
+  lastTool?: string;
+};
+
+type PersistedConversationState = {
+  prompt: string;
+  additionalInstructions?: string[];
+  phase: ConversationPhase;
+  resumePhase?: ConversationPhase;
+  agent?: AgentArtifactState;
+  pipeline?: {
+    json?: Record<string, GenericNode>;
+    messages?: unknown[];
+    updatedAt?: number;
+  };
+  retries?: number;
+  pausedReason?: string;
+  metadata?: Record<string, unknown>;
+};
+
+export type OpenAiConversationState = PersistedConversationState;
+
+type PromptWorkflowParams = {
+  page: Page;
+  conversationId: string;
+  state: PersistedConversationState;
+  previousPipeline: Record<string, GenericNode>;
+  callbacks: PipelineConversationCallbacks;
+  controlRequests?: AiAgentControlRequest[];
+  abortController?: AbortController;
+};
+
 export type OpenAiConfig = {
   openAi: OpenAI;
   pipelineProvider: PipelineProvider;
@@ -304,6 +388,7 @@ export type OpenAiConfig = {
   models?: {
     analyze?: string;
     generate?: string;
+    agent?: string;
   };
 };
 
@@ -311,6 +396,7 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
   private functionPromptSectionsPromise?: Promise<
     FunctionPromptSections | undefined
   >;
+  private agentModel: string;
 
   private throwIfAborted(abortController?: AbortController) {
     if (!abortController?.signal.aborted) {
@@ -322,9 +408,7 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
       throw reason;
     }
 
-    throw new Error(
-      typeof reason === "string" ? reason : "Operation aborted"
-    );
+    throw new Error(typeof reason === "string" ? reason : "Operation aborted");
   }
 
   private resolveFunctionProvider(): PipelineFunctionProvider | undefined {
@@ -409,6 +493,428 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
     }
   }
 
+  private createInitialState(prompt: string): PersistedConversationState {
+    return {
+      prompt,
+      phase: "idle",
+    };
+  }
+
+  private normalizeState(
+    state: unknown,
+    fallbackPrompt?: string
+  ): PersistedConversationState {
+    if (!state || typeof state !== "object") {
+      if (!fallbackPrompt) {
+        throw new Error("Conversation prompt is missing from state.");
+      }
+      return this.createInitialState(fallbackPrompt);
+    }
+
+    const snapshot = state as Partial<PersistedConversationState>;
+    const prompt = snapshot.prompt ?? fallbackPrompt;
+    if (!prompt) {
+      throw new Error("Conversation prompt is required to continue.");
+    }
+
+    return {
+      prompt,
+      additionalInstructions: snapshot.additionalInstructions
+        ? [...snapshot.additionalInstructions]
+        : undefined,
+      phase: snapshot.phase ?? "idle",
+      resumePhase: snapshot.resumePhase,
+      agent: snapshot.agent
+        ? {
+            ...snapshot.agent,
+            messages: snapshot.agent.messages
+              ? [...snapshot.agent.messages]
+              : undefined,
+            chatLog: snapshot.agent.chatLog
+              ? snapshot.agent.chatLog.map((entry) => ({ ...entry }))
+              : undefined,
+            outputData: snapshot.agent.outputData
+              ? { ...snapshot.agent.outputData }
+              : undefined,
+            lastVerification: snapshot.agent.lastVerification
+              ? { ...snapshot.agent.lastVerification }
+              : undefined,
+          }
+        : undefined,
+      pipeline: snapshot.pipeline ? { ...snapshot.pipeline } : undefined,
+      retries: snapshot.retries,
+      pausedReason: snapshot.pausedReason,
+      metadata: snapshot.metadata ? { ...snapshot.metadata } : undefined,
+    };
+  }
+
+  private cloneState(
+    state: PersistedConversationState
+  ): PersistedConversationState {
+    return {
+      ...state,
+      additionalInstructions: state.additionalInstructions
+        ? [...state.additionalInstructions]
+        : undefined,
+      agent: state.agent
+        ? {
+            ...state.agent,
+            messages: state.agent.messages
+              ? [...state.agent.messages]
+              : undefined,
+            chatLog: state.agent.chatLog
+              ? state.agent.chatLog.map((entry) => ({ ...entry }))
+              : undefined,
+            outputData: state.agent.outputData
+              ? { ...state.agent.outputData }
+              : undefined,
+            lastVerification: state.agent.lastVerification
+              ? { ...state.agent.lastVerification }
+              : undefined,
+          }
+        : undefined,
+      pipeline: state.pipeline ? { ...state.pipeline } : undefined,
+      metadata: state.metadata ? { ...state.metadata } : undefined,
+    };
+  }
+
+  private stringifyInstruction(message: unknown): string | undefined {
+    if (typeof message === "string") {
+      const trimmed = message.trim();
+      return trimmed.length ? trimmed : undefined;
+    }
+
+    if (typeof message === "number" || typeof message === "boolean") {
+      return String(message);
+    }
+
+    if (!message) {
+      return undefined;
+    }
+
+    try {
+      return JSON.stringify(message);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private applyControlRequests(
+    state: PersistedConversationState,
+    requests?: AiAgentControlRequest[]
+  ): PersistedConversationState {
+    if (!requests?.length) {
+      return state;
+    }
+
+    const next = state;
+    for (const request of requests) {
+      switch (request.type) {
+        case "pause": {
+          if (next.phase !== "paused") {
+            next.resumePhase = next.phase;
+          }
+          next.phase = "paused";
+          next.pausedReason = request.reason;
+          break;
+        }
+        case "resume": {
+          if (next.phase === "paused") {
+            next.phase = next.resumePhase ?? "idle";
+            next.resumePhase = undefined;
+            next.pausedReason = undefined;
+          }
+          break;
+        }
+        case "addMessages": {
+          const additions = request.messages
+            .map((message) => this.stringifyInstruction(message))
+            .filter(
+              (value): value is string =>
+                typeof value === "string" && value.length > 0
+            );
+          if (!additions.length) {
+            break;
+          }
+          next.additionalInstructions = [
+            ...(next.additionalInstructions ?? []),
+            ...additions,
+          ];
+          next.agent = undefined;
+          next.pipeline = undefined;
+          next.phase = "idle";
+          next.metadata = {
+            ...(next.metadata ?? {}),
+            lastInstructionAt: Date.now(),
+          };
+          break;
+        }
+        default:
+          break;
+      }
+    }
+
+    return next;
+  }
+
+  private composePrompt(state: PersistedConversationState): string {
+    if (!state.additionalInstructions?.length) {
+      return state.prompt;
+    }
+
+    const instructions = state.additionalInstructions
+      .map((instruction, index) => `${index + 1}. ${instruction}`)
+      .join("\n");
+
+    return `${state.prompt}\n\nAdditional instructions:\n${instructions}`;
+  }
+
+  private describePhase(state: PersistedConversationState): string {
+    switch (state.phase) {
+      case "idle":
+        return "Idle";
+      case "acting":
+        return "Working";
+      case "awaiting-user":
+        return state.agent?.pendingQuestion
+          ? `Awaiting user: ${state.agent.pendingQuestion}`
+          : "Awaiting user";
+      case "complete":
+        return "Complete";
+      case "paused":
+        return state.pausedReason ? `Paused: ${state.pausedReason}` : "Paused";
+      case "error":
+        return "Error";
+      default:
+        return "Unknown";
+    }
+  }
+
+  private buildAgentState(
+    conversationId: string,
+    state: PersistedConversationState,
+    statusOverride?: string,
+    isCompleteOverride?: boolean
+  ): AiAgentConversationState<PersistedConversationState> {
+    return {
+      id: conversationId,
+      state,
+      status: statusOverride ?? this.describePhase(state),
+      metadata: state.metadata,
+      isPaused: state.phase === "paused",
+      isComplete:
+        isCompleteOverride ??
+        (state.phase === "complete" && !state.pausedReason),
+    };
+  }
+
+  private normalizeValueForHash(value: unknown): unknown {
+    if (Array.isArray(value)) {
+      return value.map((item) => this.normalizeValueForHash(item));
+    }
+
+    if (value && typeof value === "object") {
+      return Object.keys(value as Record<string, unknown>)
+        .sort()
+        .reduce<Record<string, unknown>>((acc, key) => {
+          acc[key] = this.normalizeValueForHash(
+            (value as Record<string, unknown>)[key]
+          );
+          return acc;
+        }, {});
+    }
+
+    return value;
+  }
+
+  private stableHash(value: unknown): string {
+    return JSON.stringify(this.normalizeValueForHash(value));
+  }
+
+  private arePipelinesEqual(
+    first?: Record<string, GenericNode>,
+    second?: Record<string, GenericNode>
+  ): boolean {
+    if (!first && !second) {
+      return true;
+    }
+
+    if (!first || !second) {
+      return false;
+    }
+
+    return this.stableHash(first) === this.stableHash(second);
+  }
+
+  private async executePromptWorkflow({
+    page,
+    conversationId,
+    state,
+    previousPipeline,
+    callbacks,
+    controlRequests,
+    abortController,
+  }: PromptWorkflowParams): Promise<
+    AiAgentConversationState<PersistedConversationState>
+  > {
+    let nextState = this.cloneState(state);
+    nextState = this.applyControlRequests(nextState, controlRequests);
+
+    const promptText = this.composePrompt(nextState);
+
+    if (nextState.phase === "paused") {
+      await callbacks.onStatusUpdate?.(
+        nextState.pausedReason ? `Paused: ${nextState.pausedReason}` : "Paused"
+      );
+      return this.buildAgentState(conversationId, nextState);
+    }
+
+    if (nextState.phase === "awaiting-user") {
+      await callbacks.onStatusUpdate?.(
+        nextState.agent?.pendingQuestion
+          ? `Awaiting user input: ${nextState.agent.pendingQuestion}`
+          : "Awaiting user input"
+      );
+      return this.buildAgentState(
+        conversationId,
+        nextState,
+        this.describePhase(nextState),
+        false
+      );
+    }
+
+    await callbacks.onStatusUpdate?.("Agent working");
+    nextState.phase = "acting";
+    const agentResult = await this.runAgentInternal(
+      page,
+      promptText,
+      previousPipeline,
+      callbacks,
+      abortController
+    );
+
+    nextState.agent = {
+      messages: agentResult.messages,
+      lastMessage: agentResult.outputText,
+      lastTool: agentResult.lastTool,
+      pendingQuestion: agentResult.pendingQuestion,
+      outputData: agentResult.outputData
+        ? { ...agentResult.outputData }
+        : undefined,
+      chatLog: agentResult.chatMessages.length
+        ? [...agentResult.chatMessages]
+        : undefined,
+      lastVerification: agentResult.verification
+        ? { ...agentResult.verification }
+        : undefined,
+    };
+
+    nextState.metadata = {
+      ...(nextState.metadata ?? {}),
+      lastAgentMessage: agentResult.outputText,
+      lastAgentTool: agentResult.lastTool,
+      pendingQuestion: agentResult.pendingQuestion,
+      lastOutputDataSummary: agentResult.outputData?.description,
+      lastUpdatedAt: Date.now(),
+    };
+
+    for (const chat of agentResult.chatMessages) {
+      await callbacks.onStatusUpdate?.(
+        `[chat:${chat.audience}] ${chat.message}`
+      );
+    }
+
+    if (agentResult.outputData) {
+      const prefix = agentResult.outputData.final ? "Output" : "Progress";
+      await callbacks.onStatusUpdate?.(
+        `${prefix}: ${agentResult.outputData.description ?? "Data ready"}`
+      );
+    }
+
+    if (agentResult.pendingQuestion) {
+      nextState.phase = "awaiting-user";
+      await callbacks.onStatusUpdate?.(
+        `Awaiting user input: ${agentResult.pendingQuestion}`
+      );
+      return this.buildAgentState(
+        conversationId,
+        nextState,
+        "Awaiting user input",
+        false
+      );
+    }
+
+    if (agentResult.emittedPipeline) {
+      const pipelineChanged = !this.arePipelinesEqual(
+        previousPipeline,
+        agentResult.emittedPipeline.raw
+      );
+
+      nextState.pipeline = {
+        json: agentResult.emittedPipeline.raw,
+        messages: agentResult.messages,
+        updatedAt: Date.now(),
+      };
+      nextState.metadata = {
+        ...(nextState.metadata ?? {}),
+        pipelineChanged,
+        pipelineUpdatedAt: nextState.pipeline.updatedAt,
+      };
+      nextState.phase = "complete";
+
+      if (pipelineChanged) {
+        await callbacks.onPipelineUpdate(agentResult.emittedPipeline.pipeline);
+        await callbacks.onStatusUpdate?.("Pipeline updated");
+        return this.buildAgentState(
+          conversationId,
+          nextState,
+          "Pipeline updated",
+          true
+        );
+      }
+
+      await callbacks.onStatusUpdate?.("Pipeline unchanged");
+      return this.buildAgentState(
+        conversationId,
+        nextState,
+        "Pipeline unchanged",
+        true
+      );
+    }
+
+    if (agentResult.outputData?.final) {
+      nextState.phase = "complete";
+      nextState.metadata = {
+        ...(nextState.metadata ?? {}),
+        outputCompletedAt: Date.now(),
+      };
+      return this.buildAgentState(
+        conversationId,
+        nextState,
+        agentResult.outputData.description ?? "Output ready",
+        true
+      );
+    }
+
+    if (agentResult.finishRequested === false) {
+      nextState.phase = "idle";
+      return this.buildAgentState(
+        conversationId,
+        nextState,
+        agentResult.outputText ?? "Idle",
+        false
+      );
+    }
+
+    nextState.phase = "complete";
+    return this.buildAgentState(
+      conversationId,
+      nextState,
+      agentResult.outputText ?? "Complete",
+      true
+    );
+  }
+
   createModel<TModelContext>(
     model: string,
     context: TModelContext
@@ -441,16 +947,16 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
       monitor
     );
 
-    const analyzeModel = config.models?.analyze ?? ANALYZE_MODEL;
-    const generateModel = config.models?.generate ?? PIPELINE_GENERATE_MODEL;
+    const agentModel =
+      config.models?.agent ??
+      config.models?.generate ??
+      config.models?.analyze ??
+      PIPELINE_GENERATE_MODEL;
     assert(
-      OpenAiProvider.models.analyze.includes(analyzeModel),
-      "Invalid analysis model"
+      OpenAiProvider.models.agent.includes(agentModel),
+      "Invalid agent model"
     );
-    assert(
-      OpenAiProvider.models.generate.includes(generateModel),
-      "Invalid generation model"
-    );
+    this.agentModel = agentModel;
   }
 
   static get models() {
@@ -458,17 +964,18 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
       generic: ["gpt-4o-mini"],
       analyze: ["gpt-4o-mini"],
       generate: ["gpt-4o-mini"],
+      agent: ["gpt-4o-mini"],
     };
   }
 
-  public async analyze(
+  private async runAgentInternal(
     page: Page,
     userPrompt: string,
     previousPipeline: Record<string, GenericNode>,
-    onMessages?: (msgs: unknown[]) => void | Promise<void>,
+    callbacks: PipelineConversationCallbacks,
     abortController?: AbortController
-  ): Promise<AiResult<AnalysisResult>> {
-    this.config.logger.log("info", "analyze", "Analysis started", {
+  ): Promise<AgentRunResult> {
+    this.config.logger.log("info", "agent", "Unified agent started", {
       prompt: userPrompt,
     });
     this.throwIfAborted(abortController);
@@ -477,11 +984,11 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
     this.throwIfAborted(abortController);
 
     const promptConfig: ModelConfiguration = {
-      model: this.config.models?.analyze ?? ANALYZE_MODEL,
+      model: this.agentModel,
       prompt: [
         {
           role: "system",
-          content: analyzePrompt({ functions: functionPromptSections }),
+          content: agentPrompt({ functions: functionPromptSections }),
         },
         {
           role: "system",
@@ -491,21 +998,18 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
         },
         {
           role: "user",
-          content: `The pipeline should perform the following action:\n ${userPrompt}`,
+          content: `User request:\n ${userPrompt}`,
         },
       ],
       text: {
         format: {
-          type: "json_schema",
-          name: "analysis",
-          schema: analyzeOutputSchema,
-          strict: true,
+          type: "text",
         },
       },
     };
 
     const start = await this.emitStartChecked({
-      source: "pipeline.analyze",
+      source: "agent.unified",
       model: promptConfig.model,
       metadata: {
         promptLength: userPrompt.length,
@@ -513,82 +1017,357 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
     });
 
     if (!start.proceed) {
-      this.config.logger.log("debug", "analyze", "Monitor vetoed start", {
+      this.config.logger.log("debug", "agent", "Monitor vetoed start", {
         model: promptConfig.model,
       });
-      return { messages: [] };
+      return { messages: [], chatMessages: [] };
     }
 
     const functionCallRef = this.callFunctionWithTelemetry.bind(this);
+    const self = this;
+    const browserToolNames = new Set(analyzeTools.map((tool) => tool.name));
+    const workingState: {
+      emittedPipeline?: EmittedPipelineResult;
+      pendingQuestion?: string;
+      outputData?: AgentOutputData;
+      chatMessages: AgentChatMessage[];
+      verification?: AgentRunVerification;
+      finishRequested?: boolean;
+      lastTool?: string;
+    } = {
+      chatMessages: [],
+    };
+
+    const validateAndCompilePipeline = (
+      candidate: unknown
+    ):
+      | { success: true; raw: Record<string, GenericNode>; pipeline: Pipeline }
+      | { success: false; errors: unknown[] } => {
+      if (
+        !candidate ||
+        typeof candidate !== "object" ||
+        Array.isArray(candidate)
+      ) {
+        throw new Error("pipeline is required");
+      }
+
+      const pipelineJson = candidate as Record<string, GenericNode>;
+      if (!validatePipelineSchema(pipelineJson)) {
+        const errs = getPipelineValidationErrors() ?? [];
+        return { success: false, errors: errs };
+      }
+
+      const compiled = this.config.pipelineProvider.compile(pipelineJson);
+      if (!hasPipeline(compiled)) {
+        return { success: false, errors: compiled.errors };
+      }
+
+      return { success: true, raw: pipelineJson, pipeline: compiled.pipeline! };
+    };
+
+    const pipelineToolParameters = {
+      type: "object",
+      properties: {
+        pipeline: genericNodeSchema,
+        label: {
+          type: "string",
+          description: "Optional label to describe the attempt.",
+        },
+        final: {
+          type: "boolean",
+          description:
+            "Set true to mark the pipeline/output as ready for delivery.",
+        },
+        reason: {
+          type: "string",
+          description: "Optional reason or summary for the action.",
+        },
+      },
+      required: ["pipeline"],
+      additionalProperties: false,
+    };
+
+    const anyJsonValue = {
+      anyOf: [
+        { type: "object", additionalProperties: true },
+        { type: "array", items: {} },
+        { type: "string" },
+        { type: "number" },
+        { type: "boolean" },
+        { type: "null" },
+      ],
+    };
+
+    const providerTools: OpenAI.Responses.FunctionTool[] = [
+      {
+        type: "function",
+        name: "getNodeSchema",
+        description:
+          "Retrieve the JSON schema definition of a pipeline node type.",
+        parameters: {
+          type: "object",
+          properties: {
+            node: { type: "string", description: "e.g. 'page::goto'" },
+          },
+          required: ["node"],
+          additionalProperties: false,
+        },
+        strict: true,
+      },
+      {
+        type: "function",
+        name: "getPreviousPipeline",
+        description: "Returns the last emitted pipeline, if any.",
+        parameters: {
+          type: "object",
+          properties: {},
+          required: [],
+          additionalProperties: false,
+        },
+        strict: true,
+      },
+      {
+        type: "function",
+        name: "compilePipeline",
+        description:
+          "Validate a pipeline draft without emitting it. Use before running or emitting.",
+        parameters: pipelineToolParameters,
+        strict: true,
+      },
+      {
+        type: "function",
+        name: "runPipeline",
+        description:
+          "Dry-run a pipeline to verify structure. This checks compilation and dependencies.",
+        parameters: pipelineToolParameters,
+        strict: true,
+      },
+      {
+        type: "function",
+        name: "emitPipeline",
+        description:
+          "Emit a validated pipeline to the user. Only call when it is production-ready.",
+        parameters: pipelineToolParameters,
+        strict: true,
+      },
+      {
+        type: "function",
+        name: "requestUserInput",
+        description:
+          "Ask the user for more information when you cannot proceed safely.",
+        parameters: {
+          type: "object",
+          properties: {
+            question: { type: "string" },
+            urgency: {
+              type: "string",
+              enum: ["blocking", "optional"],
+              description: "Describe whether the task is blocked.",
+            },
+          },
+          required: ["question"],
+          additionalProperties: false,
+        },
+        strict: true,
+      },
+      {
+        type: "function",
+        name: "provideOutputData",
+        description:
+          "Share structured or textual output with the user when no pipeline is required.",
+        parameters: {
+          type: "object",
+          properties: {
+            description: {
+              type: "string",
+              description: "Short summary of the output.",
+            },
+            data: anyJsonValue,
+            final: {
+              type: "boolean",
+              description:
+                "Set true if this output fulfills the user's request completely.",
+            },
+          },
+          required: ["data"],
+          additionalProperties: false,
+        },
+        strict: true,
+      },
+      {
+        type: "function",
+        name: "chatWithUser",
+        description:
+          "Send a conversational message to the user or other observers without finishing the task.",
+        parameters: {
+          type: "object",
+          properties: {
+            message: { type: "string" },
+            audience: {
+              type: "string",
+              enum: ["user", "observers"],
+              description: "Who should see this message?",
+            },
+          },
+          required: ["message"],
+          additionalProperties: false,
+        },
+        strict: true,
+      },
+    ];
+
     const functionsConfig: FunctionConfiguration = {
-      tools: analyzeTools,
+      tools: [...analyzeTools, ...providerTools],
       async handle(call, _history, handlerAbortController) {
-        const params = JSON.parse(call.arguments);
-        const result = await functionCallRef(
-          page,
-          call.name,
-          params,
-          handlerAbortController ?? abortController
-        );
-        return result ?? {};
+        const params = call.arguments?.length
+          ? JSON.parse(call.arguments)
+          : {};
+        workingState.lastTool = call.name;
+
+        if (browserToolNames.has(call.name)) {
+          const result = await functionCallRef(
+            page,
+            call.name,
+            params,
+            handlerAbortController ?? abortController
+          );
+          return result ?? {};
+        }
+
+        switch (call.name) {
+          case "getNodeSchema": {
+            const nodeName = params.node as string;
+            const builtinSchema = pipelineSchema.additionalProperties.anyOf.find(
+              (s) => s.properties.node.const === nodeName
+            ) as unknown as Record<string, unknown> | undefined;
+            const nodeSchema =
+              builtinSchema ?? (await self.getFunctionNodeSchema(nodeName));
+            if (!nodeSchema) {
+              throw new TypeError(
+                `Node schema for "${nodeName}" was not found`
+              );
+            }
+            return nodeSchema;
+          }
+          case "getPreviousPipeline": {
+            return previousPipeline;
+          }
+          case "compilePipeline": {
+            const result = validateAndCompilePipeline(params.pipeline);
+            if (!result.success) {
+              workingState.verification = {
+                success: false,
+                errors: result.errors,
+                note: params.reason ?? "compile",
+                timestamp: Date.now(),
+              };
+              return { success: false, errors: result.errors };
+            }
+            workingState.verification = {
+              success: true,
+              note: params.reason ?? "compile",
+              timestamp: Date.now(),
+            };
+            return {
+              success: true,
+              nodeCount: Object.keys(result.raw).length,
+            };
+          }
+          case "runPipeline": {
+            const result = validateAndCompilePipeline(params.pipeline);
+            if (!result.success) {
+              workingState.verification = {
+                success: false,
+                errors: result.errors,
+                note: params.reason ?? "run",
+                timestamp: Date.now(),
+              };
+              return { success: false, errors: result.errors };
+            }
+            workingState.verification = {
+              success: true,
+              note: params.reason ?? "run",
+              timestamp: Date.now(),
+            };
+            return {
+              success: true,
+              note: "Dry-run successful (structure verified)",
+            };
+          }
+          case "emitPipeline": {
+            const result = validateAndCompilePipeline(params.pipeline);
+            if (!result.success) {
+              return { success: false, errors: result.errors };
+            }
+            workingState.emittedPipeline = {
+              raw: result.raw,
+              pipeline: result.pipeline,
+            };
+            workingState.finishRequested =
+              params.final !== undefined ? Boolean(params.final) : true;
+            return {
+              success: true,
+              nodeCount: Object.keys(result.raw).length,
+            };
+          }
+          case "requestUserInput": {
+            const rawQuestion = String(params.question ?? "").trim();
+            if (!rawQuestion) {
+              throw new Error("question is required");
+            }
+            workingState.pendingQuestion = rawQuestion;
+            workingState.finishRequested = false;
+            return { acknowledged: true };
+          }
+          case "provideOutputData": {
+            workingState.outputData = {
+              description:
+                typeof params.description === "string"
+                  ? params.description
+                  : undefined,
+              data: params.data,
+              final: Boolean(params.final),
+            };
+            if (params.final) {
+              workingState.finishRequested = true;
+            }
+            return { recorded: true };
+          }
+          case "chatWithUser": {
+            workingState.chatMessages.push({
+              message: String(params.message ?? ""),
+              audience:
+                params.audience === "observers" ? "observers" : "user",
+              at: Date.now(),
+            });
+            return { acknowledged: true };
+          }
+          default:
+            throw new Error(`Unsupported tool call: ${call.name}`);
+        }
       },
     };
 
     const convo = new Conversation({
       model: promptConfig,
-      functions: functionsConfig,
+      functions: {
+        ...functionsConfig,
+        handle: functionsConfig.handle.bind(this),
+      },
       openAi: this.config.openAi,
-      onMessages,
+      onMessages: callbacks.onMessages,
       logger: this.config.logger.createScope(promptConfig.model),
       abortController,
     });
 
     try {
-      let calls = 0;
       for await (const _ of convo.start()) {
-        if (calls++ > 30) {
-          convo.clearTools();
-        }
+        this.throwIfAborted(abortController);
       }
-
-      const output = convo.output;
-      const messages = convo.history;
-
-      if (!output) {
-        this.config.logger.log("error", "analyze", "Analysis failed", {
-          prompt: userPrompt,
-        });
-
-        const end = await this.emitEndChecked(
-          {
-            source: "pipeline.analyze",
-            model: promptConfig.model,
-            startedAt: start.event.startedAt,
-            metadata: { promptLength: userPrompt.length },
-            usage: convo.usage,
-          },
-          start.event.startedAt
-        );
-
-        if (!end.proceed) {
-          this.config.logger.log("debug", "analyze", "Monitor vetoed end", {
-            model: promptConfig.model,
-          });
-          return { messages };
-        }
-
-        return { messages };
-      }
-
-      const analysis = JSON.parse(output) as AnalysisResult["analysis"];
-      this.config.logger.log("info", "analyze", "Analysis ended", {
-        analysis,
-        prompt: userPrompt,
-      });
 
       const end = await this.emitEndChecked(
         {
-          source: "pipeline.analyze",
+          source: "agent.unified",
           model: promptConfig.model,
           startedAt: start.event.startedAt,
           metadata: { promptLength: userPrompt.length },
@@ -598,21 +1377,29 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
       );
 
       if (!end.proceed) {
-        this.config.logger.log("debug", "analyze", "Monitor vetoed end", {
+        this.config.logger.log("debug", "agent", "Monitor vetoed end", {
           model: promptConfig.model,
         });
-        return { messages };
       }
 
-      return { result: { analysis, prompt: userPrompt }, messages };
+      return {
+        messages: convo.history,
+        outputText: convo.output ?? undefined,
+        emittedPipeline: workingState.emittedPipeline,
+        pendingQuestion: workingState.pendingQuestion,
+        outputData: workingState.outputData,
+        chatMessages: workingState.chatMessages,
+        verification: workingState.verification,
+        finishRequested: workingState.finishRequested,
+        lastTool: workingState.lastTool,
+      };
     } catch (error) {
       await this.emitEndChecked(
         {
-          source: "pipeline.analyze",
+          source: "agent.unified",
           model: promptConfig.model,
           startedAt: start.event.startedAt,
           metadata: { promptLength: userPrompt.length },
-          usage: convo.usage,
         },
         start.event.startedAt
       );
@@ -620,217 +1407,36 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
     }
   }
 
-  public async generate(
+  public async prompt(
     page: Page,
-    { analysis, prompt: userPrompt }: AnalysisResult,
-    previousPipeline: Record<string, GenericNode>,
-    onMessages?: (msgs: unknown[]) => void | Promise<void>,
-    abortController?: AbortController
-  ): Promise<AiResult<Pipeline>> {
-    let retryCount = 0;
-    this.throwIfAborted(abortController);
-
-    const functionPromptSections = await this.getFunctionPromptSections();
-    this.throwIfAborted(abortController);
-
-    const initialPrompt = pipelinePrompt(analysis, functionPromptSections);
-    const promptConfig: ModelConfiguration = {
-      model: this.config.models?.generate ?? PIPELINE_GENERATE_MODEL,
-      prompt: [
-        { role: "system", content: initialPrompt },
-        {
-          role: "system",
-          content: `Previous pipeline version:\n ${JSON.stringify(
-            previousPipeline
-          )}`,
-        },
-        {
-          role: "user",
-          content: `The pipeline should perform the following action:\n ${userPrompt}`,
-        },
-      ],
-      text: pipelineOutput,
-    };
-
-    const start = await this.emitStartChecked({
-      source: "pipeline.generate",
-      model: promptConfig.model,
-      metadata: {
-        promptLength: userPrompt.length,
-      },
+    params: PromptParams
+  ): Promise<AiAgentConversationState<PersistedConversationState>> {
+    const state = this.createInitialState(params.userPrompt);
+    return this.executePromptWorkflow({
+      page,
+      conversationId: randomUUID(),
+      state,
+      previousPipeline: params.previousPipeline,
+      callbacks: params,
+      controlRequests: params.controlRequests,
+      abortController: params.abortController,
     });
+  }
 
-    if (!start.proceed) {
-      this.config.logger.log("debug", "generate", "Monitor vetoed start", {
-        model: promptConfig.model,
-      });
-      return { messages: [] };
-    }
-
-    let convo: Conversation | undefined;
-
-    const self = this;
-    const functionsConfig: FunctionConfiguration = {
-      tools: [
-        {
-          type: "function",
-          name: "getNodeSchema",
-          description:
-            "Retrieve the JSON schema definition of a pipeline node type.",
-          parameters: {
-            type: "object",
-            properties: {
-              node: { type: "string", description: "e.g. 'page::goto'" },
-            },
-            required: ["node"],
-            additionalProperties: false,
-          },
-          strict: true,
-        },
-      ],
-      async handle(call, history, _handlerAbortController) {
-        const params = JSON.parse(call.arguments);
-        const nodeName = params.node as string;
-        const builtinSchema = pipelineSchema.additionalProperties.anyOf.find(
-          (s) => s.properties.node.const === nodeName
-        ) as unknown as Record<string, unknown> | undefined;
-        const nodeSchema =
-          builtinSchema ?? (await self.getFunctionNodeSchema(nodeName));
-        if (!nodeSchema)
-          throw new TypeError(`Node schema for "${nodeName}" was not found`);
-
-        const callCount = history.filter(
-          (m) => m.type === "function_call_output"
-        ).length;
-        if (callCount >= 10) {
-          convo?.clearTools();
-
-          history.push({
-            type: "message",
-            role: "system",
-            content: JSON.stringify({
-              type: "tool-phase-complete",
-              message: "Complete.",
-            }),
-          });
-          functionsConfig.tools = [];
-        }
-
-        return nodeSchema;
-      },
-    };
-
-    convo = new Conversation({
-      model: promptConfig,
-      functions: functionsConfig,
-      openAi: this.config.openAi,
-      onMessages,
-      logger: this.config.logger.createScope(promptConfig.model),
-      abortController,
+  public async continuePrompt(
+    page: Page,
+    params: ContinuePromptParams
+  ): Promise<AiAgentConversationState<PersistedConversationState>> {
+    const conversationId = params.conversation.id ?? randomUUID();
+    const state = this.normalizeState(params.conversation.state);
+    return this.executePromptWorkflow({
+      page,
+      conversationId,
+      state,
+      previousPipeline: params.previousPipeline,
+      callbacks: params,
+      controlRequests: params.controlRequests,
+      abortController: params.abortController,
     });
-
-    try {
-      while (retryCount < MAX_RESPONSE_FIX_RETRY) {
-        this.throwIfAborted(abortController);
-        for await (const _ of convo.start()) {
-        }
-
-        const output = convo.output;
-        if (output) {
-          try {
-            const parsed = JSON.parse(output);
-            if (!validatePipelineSchema(parsed)) {
-              const errs = getPipelineValidationErrors();
-              throw new Error(
-                `Validation errors: ${errs
-                  ?.map((item) => JSON.stringify(item))
-                  .join(", ")}`
-              );
-            }
-            const compiled = this.config.pipelineProvider.compile(parsed);
-            if (!hasPipeline(compiled)) {
-              throw new Error(
-                `Compile errors: ${compiled.errors
-                  .map((item) => JSON.stringify(item))
-                  .join(", ")}`
-              );
-            }
-
-            const end = await this.emitEndChecked(
-              {
-                source: "pipeline.generate",
-                model: promptConfig.model,
-                startedAt: start.event.startedAt,
-                metadata: { promptLength: userPrompt.length },
-                usage: convo.usage,
-              },
-              start.event.startedAt
-            );
-
-            if (!end.proceed) {
-              this.config.logger.log(
-                "debug",
-                "generate",
-                "Monitor vetoed end",
-                { model: promptConfig.model }
-              );
-              return { messages: convo.history };
-            }
-
-            return { result: compiled.pipeline!, messages: convo.history };
-          } catch (e: any) {
-            convo.clearOutput();
-            convo.add({
-              type: "message",
-              role: "system",
-              content: JSON.stringify({
-                type: "pipeline-error",
-                message: e.message,
-              }),
-            });
-          }
-        } else {
-          this.config.logger.log(
-            "error",
-            "generate",
-            "No output from generation",
-            {}
-          );
-        }
-
-        retryCount++;
-      }
-
-      const end = await this.emitEndChecked(
-        {
-          source: "pipeline.generate",
-          model: promptConfig.model,
-          startedAt: start.event.startedAt,
-          metadata: { promptLength: userPrompt.length },
-          usage: convo?.usage,
-        },
-        start.event.startedAt
-      );
-
-      if (!end.proceed) {
-        this.config.logger.log("debug", "generate", "Monitor vetoed end", {
-          model: promptConfig.model,
-        });
-      }
-
-      return { messages: convo?.history ?? [] };
-    } catch (error) {
-      await this.emitEndChecked(
-        {
-          source: "pipeline.generate",
-          model: promptConfig.model,
-          startedAt: start.event.startedAt,
-          metadata: { promptLength: userPrompt.length },
-          usage: convo?.usage,
-        },
-        start.event.startedAt
-      );
-      throw error;
-    }
   }
 }

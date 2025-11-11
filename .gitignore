@@ -3,3 +3,5 @@ node_modules/
 .env
 *.temp.*
 *.temp
+lib/provider-alpha/
+.browsary-cli/
