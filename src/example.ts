@@ -23,7 +23,7 @@ import { OpenAiProvider, OpenAiConversationState } from "../lib";
 import {
   AiAgentConversationState,
   AiAgentControlRequest,
-} from "../lib/provider-alpha";
+} from "@silyze/browsary-ai-provider";
 
 type ConversationPaths = {
   prompt: string;

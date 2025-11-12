@@ -5,7 +5,7 @@ import {
   TokenUsage,
   UsageEventEnd,
   UsageEventStart,
-} from "./provider-alpha";
+} from "@silyze/browsary-ai-provider";
 import type { OpenAiConfig } from "./index";
 import { Logger } from "@silyze/logger";
 import OpenAI from "openai";

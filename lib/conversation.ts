@@ -2,7 +2,7 @@ import OpenAI from "openai";
 import { DEFAULT_TEMPERATURE } from "./defaults";
 import { assert } from "@mojsoski/assert";
 import { createErrorObject, type Logger } from "@silyze/logger";
-import { TokenUsage } from "./provider-alpha";
+import { TokenUsage } from "@silyze/browsary-ai-provider";
 
 export interface FunctionConfiguration {
   tools: OpenAI.Responses.Tool[];

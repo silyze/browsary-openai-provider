@@ -10,7 +10,7 @@ import {
   AiAgentControlRequest,
   UsageMonitor,
   PipelineConversationCallbacks,
-} from "./provider-alpha";
+} from "@silyze/browsary-ai-provider";
 import { analyzeTools } from "./prompts/analyze";
 import {
   validatePipelineSchema,
@@ -1023,7 +1023,16 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
       return { messages: [], chatMessages: [] };
     }
 
-    const functionCallRef = this.callFunctionWithTelemetry.bind(this);
+    const functionCallRef = (
+      fnContext: Page,
+      name: string,
+      params: unknown,
+      controller?: AbortController
+    ) =>
+      this.callFunctionWithTelemetry(fnContext, name, params, {
+        abortController: controller,
+        onStatusUpdate: callbacks.onStatusUpdate,
+      });
     const self = this;
     const browserToolNames = new Set(analyzeTools.map((tool) => tool.name));
     const workingState: {
@@ -1219,9 +1228,7 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
     const functionsConfig: FunctionConfiguration = {
       tools: [...analyzeTools, ...providerTools],
       async handle(call, _history, handlerAbortController) {
-        const params = call.arguments?.length
-          ? JSON.parse(call.arguments)
-          : {};
+        const params = call.arguments?.length ? JSON.parse(call.arguments) : {};
         workingState.lastTool = call.name;
 
         if (browserToolNames.has(call.name)) {
@@ -1237,9 +1244,10 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
         switch (call.name) {
           case "getNodeSchema": {
             const nodeName = params.node as string;
-            const builtinSchema = pipelineSchema.additionalProperties.anyOf.find(
-              (s) => s.properties.node.const === nodeName
-            ) as unknown as Record<string, unknown> | undefined;
+            const builtinSchema =
+              pipelineSchema.additionalProperties.anyOf.find(
+                (s) => s.properties.node.const === nodeName
+              ) as unknown as Record<string, unknown> | undefined;
             const nodeSchema =
               builtinSchema ?? (await self.getFunctionNodeSchema(nodeName));
             if (!nodeSchema) {
@@ -1336,8 +1344,7 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
           case "chatWithUser": {
             workingState.chatMessages.push({
               message: String(params.message ?? ""),
-              audience:
-                params.audience === "observers" ? "observers" : "user",
+              audience: params.audience === "observers" ? "observers" : "user",
               at: Date.now(),
             });
             return { acknowledged: true };
