@@ -1,6 +1,6 @@
 {
   "name": "@silyze/browsary-openai-provider",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "OpenAI provider for the Browsary pipeline framework",
   "main": "dist/lib/index.js",
   "types": "dist/lib/index.d.ts",
@@ -9,12 +9,14 @@
   "license": "MIT",
   "type": "commonjs",
   "devDependencies": {
+    "ajv": "^8.17.1",
     "@silyze/browsary-pipeline-agent": "^1.0.0",
     "dotenv": "^17.2.0",
     "puppeteer": "^24.12.1",
     "typescript": "^5.8.3"
   },
   "scripts": {
+    "test": "npm run build && node --test \"dist/tests/**/*.test.js\"",
     "watch": "npx tsc --watch",
     "build": "npx tsc",
     "prepare": "npm run build",

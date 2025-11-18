@@ -32,7 +32,6 @@ import {
   PipelineFunctionProvider,
   PipelineFunction,
   pipelineSchema,
-  genericNodeSchema,
   RefType,
   typeDescriptor,
 } from "@silyze/browsary-pipeline";
@@ -43,6 +42,7 @@ import {
   ModelConfiguration,
   FunctionConfiguration,
 } from "./conversation";
+import { createPipelineToolSchema } from "./schema-tools";
 
 type OutputSchema = {
   anyOf: Array<Record<string, unknown>>;
@@ -1074,27 +1074,7 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
       return { success: true, raw: pipelineJson, pipeline: compiled.pipeline! };
     };
 
-    const pipelineToolParameters = {
-      type: "object",
-      properties: {
-        pipeline: genericNodeSchema,
-        label: {
-          type: "string",
-          description: "Optional label to describe the attempt.",
-        },
-        final: {
-          type: "boolean",
-          description:
-            "Set true to mark the pipeline/output as ready for delivery.",
-        },
-        reason: {
-          type: "string",
-          description: "Optional reason or summary for the action.",
-        },
-      },
-      required: ["pipeline"],
-      additionalProperties: false,
-    };
+    const pipelineToolParameters = createPipelineToolSchema();
 
     const anyJsonValue = {
       anyOf: [
