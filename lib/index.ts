@@ -1224,14 +1224,16 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
           type: "object",
           properties: {
             message: { type: "string" },
-            audience: {
+          },
+          required: ["message"],
+          additionalProperties: false,
+          patternProperties: {
+            "^audience$": {
               type: "string",
               enum: ["user", "observers"],
               description: "Who should see this message?",
             },
           },
-          required: ["message"],
-          additionalProperties: false,
         },
         strict: true,
       },
