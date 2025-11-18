@@ -1194,19 +1194,21 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
         parameters: {
           type: "object",
           properties: {
-            description: {
+            data: { $ref: "#/$defs/jsonValue" },
+          },
+          required: ["data"],
+          additionalProperties: false,
+          patternProperties: {
+            "^description$": {
               type: "string",
               description: "Short summary of the output.",
             },
-            data: { $ref: "#/$defs/jsonValue" },
-            final: {
+            "^final$": {
               type: "boolean",
               description:
                 "Set true if this output fulfills the user's request completely.",
             },
           },
-          required: ["data"],
-          additionalProperties: false,
           $defs: {
             jsonValue: jsonValueDefinition,
           },
