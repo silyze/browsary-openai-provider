@@ -1,14 +1,10 @@
-import {
-  genericNodeSchema,
-  pipelineSchema,
-} from "@silyze/browsary-pipeline";
+import { pipelineSchema } from "@silyze/browsary-pipeline";
 
 const pipelineStructureSchema = {
   type: "object",
-  properties: {},
-  additionalProperties: {
-    $ref: "#/$defs/GenericNode",
-  },
+  description:
+    "Pipeline nodes keyed by their unique IDs. Each value is validated server-side.",
+  additionalProperties: true,
 } as const;
 
 export type PipelineToolSchema = ReturnType<typeof createPipelineToolSchema>;
@@ -34,7 +30,6 @@ export function createPipelineToolSchema() {
     },
     required: ["pipeline"],
     additionalProperties: false,
-    $defs: genericNodeSchema.$defs,
   } as const;
 }
 

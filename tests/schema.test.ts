@@ -12,5 +12,9 @@ test("pipeline tool schema compiles with Ajv", () => {
     ajv.compile(schema);
   });
 
-  assert.ok(schema.$defs?.GenericNode, "GenericNode definition is missing");
+  assert.equal(
+    (schema as Record<string, unknown>)["$defs"],
+    undefined,
+    "Pipeline tool schema should not expose $defs"
+  );
 });
