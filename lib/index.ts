@@ -1091,14 +1091,30 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
     const pipelineToolParameters = createPipelineToolSchema();
 
     const anyJsonValue = {
-      anyOf: [
-        { type: "object", additionalProperties: true },
-        { type: "array", items: {} },
-        { type: "string" },
-        { type: "number" },
-        { type: "boolean" },
-        { type: "null" },
-      ],
+      $ref: "#/$defs/jsonValue",
+      $defs: {
+        jsonValue: {
+          description:
+            "Represents any JSON value, including deeply nested structures.",
+          anyOf: [
+            {
+              type: "object",
+              additionalProperties: false,
+              patternProperties: {
+                "^.+$": { $ref: "#/$defs/jsonValue" },
+              },
+            },
+            {
+              type: "array",
+              items: { $ref: "#/$defs/jsonValue" },
+            },
+            { type: "string" },
+            { type: "number" },
+            { type: "boolean" },
+            { type: "null" },
+          ],
+        },
+      },
     };
 
     const providerTools: OpenAI.Responses.FunctionTool[] = [
