@@ -1,11 +1,17 @@
 import { pipelineSchema } from "@silyze/browsary-pipeline";
 
 const pipelineStructureSchema = {
+  $schema: pipelineSchema.$schema as unknown,
+  $id: `${pipelineSchema.$id}/tool`,
+  $defs: pipelineSchema.$defs as unknown,
   type: "object",
   description:
     "Pipeline nodes keyed by their unique IDs. Each value is validated server-side.",
-  additionalProperties: true,
-} as const;
+  patternProperties: {
+    "^.+$": pipelineSchema.additionalProperties as unknown,
+  },
+  additionalProperties: false,
+} satisfies Record<string, unknown>;
 
 export type PipelineToolSchema = ReturnType<typeof createPipelineToolSchema>;
 
