@@ -1162,7 +1162,9 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
           type: "object",
           properties: {
             question: { type: "string" },
-            urgency: {
+          },
+          patternProperties: {
+            "^urgency$": {
               type: "string",
               enum: ["blocking", "optional"],
               description: "Describe whether the task is blocked.",
