@@ -19,17 +19,25 @@ export function createPipelineToolSchema() {
   return {
     type: "object",
     properties: {
-      pipeline: pipelineStructureSchema,
-      label: {
+      pipeline: {
+        description:
+          "Pipeline payload. Can be an object map of nodes or any serialized representation.",
+        type: "string",
+      },
+    },
+    // Optional fields are expressed via patternProperties so that strict schema
+    // validation only requires the mandatory entries listed in `properties`.
+    patternProperties: {
+      "^label$": {
         type: "string",
         description: "Optional label to describe the attempt.",
       },
-      final: {
+      "^final$": {
         type: "boolean",
         description:
           "Set true to mark the pipeline/output as ready for delivery.",
       },
-      reason: {
+      "^reason$": {
         type: "string",
         description: "Optional reason or summary for the action.",
       },
@@ -62,13 +70,14 @@ function hasNodeProperties(
     typeof candidate === "object" &&
     candidate !== null &&
     "properties" in candidate &&
+    typeof (candidate as { properties?: Record<string, unknown> })
+      .properties === "object" &&
     typeof (
-      candidate as { properties?: Record<string, unknown> }
-    ).properties === "object" &&
-    typeof (
-      (candidate as {
-        properties?: { node?: { const?: string } };
-      }).properties?.node?.const ?? ""
+      (
+        candidate as {
+          properties?: { node?: { const?: string } };
+        }
+      ).properties?.node?.const ?? ""
     ) === "string"
   );
 }

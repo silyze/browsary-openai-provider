@@ -1055,15 +1055,26 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
     ):
       | { success: true; raw: Record<string, GenericNode>; pipeline: Pipeline }
       | { success: false; errors: unknown[] } => {
-      if (
-        !candidate ||
-        typeof candidate !== "object" ||
-        Array.isArray(candidate)
-      ) {
-        throw new Error("pipeline is required");
+      let normalized: unknown = candidate;
+      if (typeof normalized === "string") {
+        const trimmed = normalized.trim();
+        if (!trimmed) {
+          throw new Error("pipeline is required");
+        }
+        try {
+          normalized = JSON.parse(trimmed);
+        } catch (error) {
+          throw new Error(
+            `pipeline must be valid JSON: ${(error as Error).message}`
+          );
+        }
       }
 
-      const pipelineJson = candidate as Record<string, GenericNode>;
+      if (!normalized || typeof normalized !== "object" || Array.isArray(normalized)) {
+        throw new Error("pipeline must be a JSON object");
+      }
+
+      const pipelineJson = normalized as Record<string, GenericNode>;
       if (!validatePipelineSchema(pipelineJson)) {
         const errs = getPipelineValidationErrors() ?? [];
         return { success: false, errors: errs };
