@@ -42,7 +42,10 @@ import {
   ModelConfiguration,
   FunctionConfiguration,
 } from "./conversation";
-import { createPipelineToolSchema } from "./schema-tools";
+import {
+  createPipelineToolSchema,
+  getBuiltinNodeSchema,
+} from "./schema-tools";
 
 type OutputSchema = {
   anyOf: Array<Record<string, unknown>>;
@@ -1224,10 +1227,9 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
         switch (call.name) {
           case "getNodeSchema": {
             const nodeName = params.node as string;
-            const builtinSchema =
-              pipelineSchema.additionalProperties.anyOf.find(
-                (s) => s.properties.node.const === nodeName
-              ) as unknown as Record<string, unknown> | undefined;
+            const builtinSchema = getBuiltinNodeSchema(
+              nodeName
+            ) as unknown as Record<string, unknown> | undefined;
             const nodeSchema =
               builtinSchema ?? (await self.getFunctionNodeSchema(nodeName));
             if (!nodeSchema) {

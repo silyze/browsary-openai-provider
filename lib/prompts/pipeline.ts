@@ -3,6 +3,7 @@ import {
   genericNodeSchema,
   RefType,
 } from "@silyze/browsary-pipeline";
+import { getAllBuiltinNodeSchemas } from "../schema-tools";
 import { AnalyzeOutput } from "@silyze/browsary-ai-provider";
 import { FunctionPromptSections } from "./functions";
 
@@ -43,7 +44,7 @@ function getType(schema: unknown): string | undefined {
 }
 
 export function formatPipelineNodes(schema: typeof pipelineSchema): string {
-  const nodes = schema.additionalProperties.anyOf;
+  const nodes = getAllBuiltinNodeSchemas(schema);
   return nodes
     .map((node) => {
       const name = node.properties.node.const;
