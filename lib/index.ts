@@ -980,12 +980,19 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
   }
 
   static get models() {
+    const supported = [
+      "gpt-4o-mini",
+      "gpt-5-nano",
+      "gpt-5-mini",
+      "gpt-5",
+      "gpt-5.1",
+    ];
     return {
-      generic: ["gpt-4o-mini"],
-      analyze: ["gpt-4o-mini"],
-      generate: ["gpt-4o-mini"],
-      agent: ["gpt-4o-mini"],
-      status: ["gpt-4o-mini"],
+      generic: supported,
+      analyze: supported,
+      generate: supported,
+      agent: supported,
+      status: supported,
     };
   }
 

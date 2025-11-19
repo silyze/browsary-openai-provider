@@ -92,6 +92,8 @@ All cached prompts, conversations, and pipelines live under `.browsary-cli/` to 
 | `logger`           | `Logger`                                  | Scoped logger for debug/info/error events.            |
 | `models?`          | `{ agent?: string; generate?: string; analyze?: string; status?: string }` | Override default OpenAI model identifiers (the agent model powers the unified workflow, while `status` controls AI narration for tool-call updates). |
 
+Supported identifiers currently include `gpt-4o-mini`, `gpt-5-nano`, `gpt-5-mini`, `gpt-5`, and `gpt-5.1`.
+
 Function-call status updates use a lightweight prompt on the `status` model (defaults to the analyze/generate choice) to narrate what each tool invocation is attempting and how it finished. Override `models.status` if you want a different model for these blurbs, or omit `onStatusUpdate` to silence them entirely.
 
 ## API Reference
