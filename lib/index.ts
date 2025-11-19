@@ -10,6 +10,7 @@ import {
   AiAgentControlRequest,
   UsageMonitor,
   PipelineConversationCallbacks,
+  FunctionCallStatusOptions,
 } from "@silyze/browsary-ai-provider";
 import { analyzeTools } from "./prompts/analyze";
 import {
@@ -23,7 +24,7 @@ import {
   FunctionPromptSections,
 } from "./prompts/functions";
 import { Page } from "puppeteer-core";
-import { type Logger } from "@silyze/logger";
+import { type Logger, createErrorObject } from "@silyze/logger";
 import {
   GenericNode,
   hasPipeline,
@@ -392,6 +393,7 @@ export type OpenAiConfig = {
     analyze?: string;
     generate?: string;
     agent?: string;
+    status?: string;
   };
 };
 
@@ -400,6 +402,7 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
     FunctionPromptSections | undefined
   >;
   private agentModel: string;
+  private statusModel: string;
 
   private throwIfAborted(abortController?: AbortController) {
     if (!abortController?.signal.aborted) {
@@ -960,6 +963,20 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
       "Invalid agent model"
     );
     this.agentModel = agentModel;
+
+    if (config.models?.status) {
+      assert(
+        OpenAiProvider.models.status.includes(config.models.status),
+        "Invalid status model"
+      );
+      this.statusModel = config.models.status;
+    } else {
+      this.statusModel =
+        config.models?.analyze ??
+        config.models?.generate ??
+        config.models?.agent ??
+        OpenAiProvider.models.status[0];
+    }
   }
 
   static get models() {
@@ -968,7 +985,207 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
       analyze: ["gpt-4o-mini"],
       generate: ["gpt-4o-mini"],
       agent: ["gpt-4o-mini"],
+      status: ["gpt-4o-mini"],
     };
+  }
+
+  private truncateStatusSnippet(text: string, limit = 400): string {
+    if (text.length <= limit) {
+      return text;
+    }
+    return `${text.slice(0, limit)}...`;
+  }
+
+  private describeValueForStatus(value: unknown): string | undefined {
+    if (value === undefined || value === null) {
+      return undefined;
+    }
+
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      return trimmed ? this.truncateStatusSnippet(trimmed) : undefined;
+    }
+
+    if (typeof value === "number" || typeof value === "boolean") {
+      return String(value);
+    }
+
+    if (Array.isArray(value)) {
+      const serialized = (() => {
+        try {
+          return JSON.stringify(value);
+        } catch {
+          return undefined;
+        }
+      })();
+      const summary = serialized
+        ? this.truncateStatusSnippet(serialized)
+        : `${value.length} items`;
+      return `Array(len=${value.length}) ${summary}`;
+    }
+
+    if (typeof value === "object") {
+      try {
+        const json = JSON.stringify(value);
+        if (!json || json === "{}") {
+          return undefined;
+        }
+        return this.truncateStatusSnippet(json);
+      } catch {
+        return undefined;
+      }
+    }
+
+    return undefined;
+  }
+
+  private async createFunctionStatusUpdate(
+    phase: "intent" | "success" | "failure",
+    name: string,
+    params: unknown,
+    details?: { result?: unknown; error?: unknown },
+    abortController?: AbortController
+  ): Promise<string | undefined> {
+    try {
+      const inputLines = [
+        `Phase: ${phase}`,
+        `Function: ${name}`,
+        `Parameters: ${
+          this.describeValueForStatus(params) ?? "Not provided"
+        }`,
+      ];
+
+      if ("result" in (details ?? {}) || phase === "success") {
+        inputLines.push(
+          `Result: ${
+            this.describeValueForStatus(details?.result) ?? "No structured data"
+          }`
+        );
+      }
+
+      if ("error" in (details ?? {}) || phase === "failure") {
+        inputLines.push(
+          `Error: ${
+            this.describeValueForStatus(details?.error) ?? "No error details"
+          }`
+        );
+      }
+
+      const response = await (
+        await this.config.openAi
+      ).responses.create(
+        {
+          model: this.statusModel,
+          temperature: 0.2,
+          input: [
+            {
+              role: "system",
+              content:
+                "You craft short, natural status updates describing browser automation tool calls. " +
+                "Use present-progressive verbs for intent, past tense for success, and actionable phrasing for failures. " +
+                "Stay under 18 words, avoid quoting function names, and speak as the agent narrating its work.",
+            },
+            {
+              role: "user",
+              content: inputLines.join("\n"),
+            },
+          ],
+          text: {
+            format: {
+              type: "text",
+            },
+          },
+        },
+        abortController ? { signal: abortController.signal } : undefined
+      );
+
+      const text = response.output_text?.trim();
+      return text || undefined;
+    } catch (error) {
+      this.config.logger.log(
+        "warn",
+        "status",
+        "Failed to generate function status update",
+        {
+          phase,
+          function: name,
+          error: createErrorObject(error),
+        }
+      );
+      return undefined;
+    }
+  }
+
+  protected override async callFunctionWithTelemetry(
+    context: Page,
+    name: string,
+    params: any,
+    options?: FunctionCallStatusOptions
+  ): Promise<unknown> {
+    if (!options?.onStatusUpdate) {
+      return super.callFunctionWithTelemetry(context, name, params, options);
+    }
+
+    const abortController = options.abortController;
+    const safeStatusUpdate = async (message?: string) => {
+      if (!message) {
+        return;
+      }
+      try {
+        await options.onStatusUpdate?.(message);
+      } catch {
+        // Ignore downstream status update failures.
+      }
+    };
+
+    const intentStatus = await this.createFunctionStatusUpdate(
+      "intent",
+      name,
+      params,
+      undefined,
+      abortController
+    );
+
+    if (!intentStatus) {
+      return super.callFunctionWithTelemetry(context, name, params, options);
+    }
+
+    await safeStatusUpdate(intentStatus);
+
+    const telemetryOptions: FunctionCallStatusOptions | undefined = options
+      ? { ...options, onStatusUpdate: undefined, describe: undefined }
+      : undefined;
+
+    try {
+      const result = await super.callFunctionWithTelemetry(
+        context,
+        name,
+        params,
+        telemetryOptions
+      );
+      const successStatus = await this.createFunctionStatusUpdate(
+        "success",
+        name,
+        params,
+        { result },
+        abortController
+      );
+      await safeStatusUpdate(successStatus);
+      return result;
+    } catch (error) {
+      const failureStatus = await this.createFunctionStatusUpdate(
+        "failure",
+        name,
+        params,
+        {
+          error:
+            error instanceof Error ? { message: error.message } : (error as unknown),
+        },
+        abortController
+      );
+      await safeStatusUpdate(failureStatus);
+      throw error;
+    }
   }
 
   private async runAgentInternal(

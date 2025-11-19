@@ -90,7 +90,9 @@ All cached prompts, conversations, and pipelines live under `.browsary-cli/` to 
 | `openAi`           | `OpenAI \| Promise<OpenAI>`               | An instantiated OpenAI client (or a promise thereof). |
 | `pipelineProvider` | `PipelineProvider`                        | Compiles and runs generated pipelines.                |
 | `logger`           | `Logger`                                  | Scoped logger for debug/info/error events.            |
-| `models?`          | `{ agent?: string; generate?: string; analyze?: string }` | Override default OpenAI model identifiers (the agent model is used for the unified workflow). |
+| `models?`          | `{ agent?: string; generate?: string; analyze?: string; status?: string }` | Override default OpenAI model identifiers (the agent model powers the unified workflow, while `status` controls AI narration for tool-call updates). |
+
+Function-call status updates use a lightweight prompt on the `status` model (defaults to the analyze/generate choice) to narrate what each tool invocation is attempting and how it finished. Override `models.status` if you want a different model for these blurbs, or omit `onStatusUpdate` to silence them entirely.
 
 ## API Reference
 
@@ -108,7 +110,7 @@ Extends `AiProvider<Page, OpenAiConfig>`. It orchestrates a single-phase agent t
 Starts a new conversation. The provider will:
 
 1. Expose browsing, pipeline, and communication tools simultaneously so the agent can explore, validate, emit, or simply chat in a single loop.
-2. Emit `onStatusUpdate` for browsing milestones, chat messages, pending questions, output payloads, and verification steps.
+2. Emit `onStatusUpdate` for browsing milestones, chat messages, pending questions, output payloads, verification steps, and AI-authored narratives explaining each browser/tool call.
 3. Invoke `onPipelineUpdate` **only when** the compiled pipeline differs from `params.previousPipeline`.
 4. Return a conversation state object (matching `OpenAiConversationState`) that captures agent metadata, pending questions, and pipeline history for later resumption.
 
