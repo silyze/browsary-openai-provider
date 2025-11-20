@@ -3,6 +3,7 @@ import { DEFAULT_TEMPERATURE } from "./defaults";
 import { assert } from "@mojsoski/assert";
 import { createErrorObject, type Logger } from "@silyze/logger";
 import { TokenUsage } from "@silyze/browsary-ai-provider";
+import { createResponseWithTemperatureFallback } from "./openai-utils";
 
 export interface FunctionConfiguration {
   tools: OpenAI.Responses.Tool[];
@@ -152,7 +153,8 @@ export class Conversation {
 
       yield;
       this.#throwIfAborted();
-      const response = await this.#config.openAi.responses.create(
+      const response = await createResponseWithTemperatureFallback(
+        this.#config.openAi,
         {
           model,
           input: this.#history,
@@ -160,7 +162,8 @@ export class Conversation {
           tools: this.#config.functions.tools,
           text: this.#config.model.text,
         },
-        { signal: this.#config.abortController?.signal ?? undefined }
+        { signal: this.#config.abortController?.signal ?? undefined },
+        this.#config.logger
       );
 
       this.#usage = this.#mapUsage(response.usage);

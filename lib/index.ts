@@ -37,6 +37,7 @@ import {
   typeDescriptor,
 } from "@silyze/browsary-pipeline";
 import { OpenAiModel } from "./model";
+import { createResponseWithTemperatureFallback } from "./openai-utils";
 
 import {
   Conversation,
@@ -1078,9 +1079,8 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
         );
       }
 
-      const response = await (
-        await this.config.openAi
-      ).responses.create(
+      const response = await createResponseWithTemperatureFallback(
+        await this.config.openAi,
         {
           model: this.statusModel,
           temperature: 0.2,
@@ -1103,7 +1103,8 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
             },
           },
         },
-        abortController ? { signal: abortController.signal } : undefined
+        abortController ? { signal: abortController.signal } : undefined,
+        this.config.logger
       );
 
       const text = response.output_text?.trim();

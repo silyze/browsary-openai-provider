@@ -10,6 +10,7 @@ import type { OpenAiConfig } from "./index";
 import { Logger } from "@silyze/logger";
 import OpenAI from "openai";
 import { DEFAULT_TEMPERATURE } from "./defaults";
+import { createResponseWithTemperatureFallback } from "./openai-utils";
 
 type UsageEmitter = {
   emitStartChecked(
@@ -92,13 +93,14 @@ export class OpenAiModel<TModelContext> extends AiModel<TModelContext> {
     }
 
     try {
-      const response = await (
-        await this.#config.openAi
-      ).responses.create({
-        input,
-        temperature: DEFAULT_TEMPERATURE,
-        model: this.#model,
-      });
+      const response = await createResponseWithTemperatureFallback(
+        await this.#config.openAi,
+        {
+          input,
+          temperature: DEFAULT_TEMPERATURE,
+          model: this.#model,
+        }
+      );
 
       const outputText = response.output_text ?? "";
       this.#logger.log("debug", "prompt", "Prompt completed", response.output);
@@ -163,21 +165,22 @@ export class OpenAiModel<TModelContext> extends AiModel<TModelContext> {
     }
 
     try {
-      const response = await (
-        await this.#config.openAi
-      ).responses.create({
-        input,
-        temperature: DEFAULT_TEMPERATURE,
-        model: this.#model,
-        text: {
-          format: {
-            type: "json_schema",
-            name: "output",
-            schema: schema as Record<string, unknown>,
-            strict: true,
+      const response = await createResponseWithTemperatureFallback(
+        await this.#config.openAi,
+        {
+          input,
+          temperature: DEFAULT_TEMPERATURE,
+          model: this.#model,
+          text: {
+            format: {
+              type: "json_schema",
+              name: "output",
+              schema: schema as Record<string, unknown>,
+              strict: true,
+            },
           },
-        },
-      });
+        }
+      );
 
       const outputText = response.output_text ?? "";
       this.#logger.log(
