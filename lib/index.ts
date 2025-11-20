@@ -1610,6 +1610,15 @@ export class OpenAiProvider extends AiProvider<Page, OpenAiConfig> {
         this.throwIfAborted(abortController);
       }
 
+      const finalOutput = convo.output?.trim();
+      if (finalOutput) {
+        workingState.chatMessages.push({
+          message: finalOutput,
+          audience: "user",
+          at: Date.now(),
+        });
+      }
+
       const end = await this.emitEndChecked(
         {
           source: "agent.unified",
