@@ -4,6 +4,16 @@ import { Logger } from "@silyze/logger";
 type ResponsePayload = OpenAI.Responses.ResponseCreateParamsNonStreaming;
 type ResponseOptions = Parameters<OpenAI["responses"]["create"]>[1];
 
+// Models in this set do not support the `temperature` parameter in the Responses API.
+const TEMPERATURE_UNSUPPORTED_MODELS = new Set([
+  "gpt-5",
+  "gpt-5.1",
+  "gpt-5-mini",
+  "gpt-5-nano",
+]);
+
+const normalizeModel = (model?: string) => model?.toLowerCase();
+
 const isUnsupportedTemperatureError = (error: unknown) => {
   if (!(error instanceof Error)) {
     return false;
@@ -28,6 +38,15 @@ export async function createResponseWithTemperatureFallback(
   const hasTemperature =
     "temperature" in payload &&
     (payload as { temperature?: unknown }).temperature !== undefined;
+  const model = normalizeModel((payload as { model?: string }).model);
+
+  const omitTemperatureFirst = hasTemperature && model
+    ? TEMPERATURE_UNSUPPORTED_MODELS.has(model)
+    : false;
+
+  const payloadWithoutTemperature = omitTemperatureFirst
+    ? (({ temperature, ...rest }) => rest)(payload as Record<string, unknown>)
+    : undefined;
 
   if (!hasTemperature) {
     return openAi.responses.create(
@@ -38,7 +57,7 @@ export async function createResponseWithTemperatureFallback(
 
   try {
     return (await openAi.responses.create(
-      payload,
+      (payloadWithoutTemperature ?? payload) as ResponsePayload,
       options
     )) as OpenAI.Responses.Response;
   } catch (error) {
@@ -46,8 +65,9 @@ export async function createResponseWithTemperatureFallback(
       throw error;
     }
 
-    const { temperature, ...payloadWithoutTemperature } =
-      payload as Record<string, unknown>;
+    const { temperature, ...payloadWithoutTemp } =
+      (payloadWithoutTemperature as Record<string, unknown>) ??
+      (payload as Record<string, unknown>);
 
     logger?.log(
       "warn",
@@ -57,7 +77,7 @@ export async function createResponseWithTemperatureFallback(
     );
 
     return openAi.responses.create(
-      payloadWithoutTemperature as ResponsePayload,
+      payloadWithoutTemp as ResponsePayload,
       options
     ) as Promise<OpenAI.Responses.Response>;
   }
